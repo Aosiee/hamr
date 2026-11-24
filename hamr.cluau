@@ -253,6 +253,14 @@ suite:step("samples", {
 				c:fail("the background process survived its step")
 			}
 		}, { HAMR_UNSET_ME = "1" })
+		sample(ctx, "stall", "stall", {}, 0, function(c: Context, r: Report) {
+			for (_, name in { "a", "b", "x", "parent", "parent/one", "parent/two" }) {
+				expectStatus(c, r, name, "pass")
+			}
+			if (r.wallSeconds > 5) {
+				c:fail(`the run took {r.wallSeconds} s: the scheduler stalled`)
+			}
+		})
 		sample(ctx, "queued", "queued", {}, 0, function(c: Context, r: Report) {
 			const parent = stepOf(r, "parent")
 			if (parent == nil || (parent.queuedSeconds or 0) < 0.6) {

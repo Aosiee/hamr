@@ -1,0 +1,22 @@
+// An exclusive step becomes ready while another step runs and a step that
+// started earlier is about to start sub-steps: the sub-steps must still be
+// admitted (the exclusive step waits for their parent), or nothing can move.
+const hamr = require("@hamr")
+const suite = hamr.suite("stall")
+
+suite:step("a", { run = { "sleep", "1" }, timeout = 20, budget = 50 })
+suite:step("b", { run = { "sleep", "0.1" }, timeout = 20, budget = 0.2 })
+suite:step("x", { run = { "sleep", "0.1" }, needs = { "b" }, resources = { exclusive = true }, timeout = 20, budget = 45 })
+suite:step("parent", {
+	timeout = 20,
+	budget = 10,
+	resources = { cpu = 0 },
+	run = function(ctx: hamr.Context) {
+		ctx:sleep(0.3)
+		for (_, name in { "one", "two" }) {
+			ctx:step(name, { run = { "sleep", "0.3" } })
+		}
+	},
+})
+
+return suite

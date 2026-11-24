@@ -609,16 +609,58 @@ function M.execute(plan: Plan): Outcome {
 			}
 			return a.order < b.order
 		})
+		// An exclusive step that cannot start yet holds back what is behind
+		// it, so it is not starved - except the sub-steps of running steps:
+		// the exclusive step is waiting for those steps to end, and they end
+		// only when their sub-steps have run.
 		let started = false
+		let holding = false
 		for (_, n in candidates) {
-			if (fits(n)) {
-				start(n)
-				started = true
-			} else if (n.exclusive) {
-				break
+			const parent = n.parent
+			const insideRunning = parent != nil && parent.state == "running"
+			if (!holding || insideRunning) {
+				if (fits(n)) {
+					start(n)
+					started = true
+				} else if (n.exclusive) {
+					holding = true
+				}
 			}
 		}
 		return started
+	}
+
+	// Nothing runs a process, nothing sleeps, nothing is woken, and no
+	// waiting step fits: the steps in `running` only wait for sub-steps the
+	// resources keep out. Start one anyway (a sub-step of a running step
+	// first) rather than wait for ever.
+	local function breakStall(): boolean {
+		if (host.running() > 0) {
+			return false
+		}
+		for (_, n in running) {
+			if (n.wakeAt != nil) {
+				return false
+			}
+		}
+		let pick: Node? = nil
+		for (_, n in nodes) {
+			if (n.state == "waiting" && readiness(n) == "ready") {
+				const parent = n.parent
+				if (parent != nil && parent.state == "running") {
+					pick = n
+					break
+				}
+				if (pick == nil) {
+					pick = n
+				}
+			}
+		}
+		if (pick != nil) {
+			start(pick)
+			return true
+		}
+		return false
 	}
 
 	while (true) {
@@ -669,6 +711,9 @@ function M.execute(plan: Plan): Outcome {
 			}
 		}
 		if (#wake > 0) {
+			continue
+		}
+		if (!started && breakStall()) {
 			continue
 		}
 		const results, interrupted = host.poll(pollFor)
