@@ -282,6 +282,12 @@ local function vsMedian(r: StepResult, medians: Medians): string {
 	if (median == nil || median <= 0) {
 		return "new"
 	}
+	// Against a median under a second a percentage says nothing: the
+	// difference in seconds does.
+	if (median < 1) {
+		const diff = M.activeSeconds(r) - median
+		return (if (diff >= 0) "+" else "-") .. util.seconds(math.abs(diff))
+	}
 	const change = (M.activeSeconds(r) - median) / median * 100
 	return string.format("%+.0f%%", change)
 }
