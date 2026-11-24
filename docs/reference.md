@@ -94,8 +94,20 @@ timeout without yielding raises an error in that step.
 A rule is any function `(result, ctx) -> ()`. Whatever a rule decides, a
 command step that exited non-zero fails.
 
-Processes a step leaves running in its process group are a `stray` warning,
-and hamr ends them.
+When a step's process ends, what it started in its process group gets five
+seconds to finish (an app's crash watcher writing its report). Whatever is
+still running then is a `stray` warning, and hamr ends it.
+
+## Choosing what runs
+
+`hamr run` takes the tier (`--tier`, default `fast`; a tier includes the
+ones below it), or the steps `--only <glob>` names whatever their tier,
+minus `--skip <glob>`. `--changed` keeps only the steps whose `paths`
+match a file changed in the working copy (jj: against `@-`; git: against
+`HEAD`, untracked files included; `--since <rev>` names another base; the
+nearest repository around the suite is the one asked). Then whatever a
+chosen step needs runs too, unless `--skip` named it. `--dry-run` prints
+the choice and runs nothing.
 
 ## The scheduler
 

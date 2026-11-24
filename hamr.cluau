@@ -75,6 +75,16 @@ suite:step("selftest", {
 	budget = 5,
 })
 
+suite:step("changed", {
+	doc = "--changed against a real git repository: an edit runs only the steps whose paths it touches.",
+	needs = { "build" },
+	timeout = 60,
+	budget = 5,
+	run = function(ctx: Context) {
+		ctx:run({ bin, "exec", "tests/scripts/changed.cluau", host.join(ctx.root, bin), host.join(ctx.out, "changed-repo") })
+	},
+})
+
 local function stepOf(r: Report, name: string): StepResult? {
 	for (_, s in reportLib.flatten(r.steps)) {
 		if (s.name == name) {

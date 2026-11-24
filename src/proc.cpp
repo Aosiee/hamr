@@ -33,6 +33,14 @@ struct Child {
     bool TimedOut = false;
     bool Killed = false;
     double KillAt = 0;
+    // The leader has been reaped; the result waits for its group to empty.
+    bool Reaped = false;
+    int Status = 0;
+    rusage Usage = {};
+    double EndedAt = 0;
+    double LingerUntil = 0;
+    bool Stray = false;
+    double StrayKillAt = 0;
 };
 
 struct Children {
@@ -191,7 +199,10 @@ int Spawn(lua_State* L) {
     return 1;
 }
 
-void PushResult(lua_State* L, int id, const Child& child, int status, const rusage& usage, double now) {
+void PushResult(lua_State* L, int id, const Child& child) {
+    const int status = child.Status;
+    const rusage& usage = child.Usage;
+    const double now = child.EndedAt;
     lua_newtable(L);
     lua_pushinteger(L, id);
     lua_setfield(L, -2, "id");
@@ -214,12 +225,7 @@ void PushResult(lua_State* L, int id, const Child& child, int status, const rusa
     lua_setfield(L, -2, "cpuSeconds");
     lua_pushnumber(L, (double)usage.ru_maxrss / 1024.0);
     lua_setfield(L, -2, "peakRssMB");
-    // A process the child left behind in its group is a stray: report it
-    // and end it, so it cannot skew the next step.
-    bool left = kill(-child.Pid, 0) == 0;
-    if (left)
-        kill(-child.Pid, SIGKILL);
-    lua_pushboolean(L, left);
+    lua_pushboolean(L, child.Stray);
     lua_setfield(L, -2, "leftProcesses");
 }
 
@@ -235,16 +241,40 @@ int Poll(lua_State* L) {
         double now = MonotonicSeconds();
         for (auto it = Kids().Live.begin(); it != Kids().Live.end();) {
             Child& child = it->second;
-            int status = 0;
-            rusage usage = {};
-            pid_t reaped = wait4(child.Pid, &status, WNOHANG, &usage);
-            if (reaped == child.Pid || (reaped < 0 && errno == ECHILD)) {
-                if (reaped < 0)
-                    status = 255 << 8;
-                PushResult(L, it->first, child, status, usage, now);
-                lua_rawseti(L, -2, ++count);
-                ForgetGroup(child.Pid);
-                it = Kids().Live.erase(it);
+            if (!child.Reaped) {
+                int status = 0;
+                rusage usage = {};
+                pid_t reaped = wait4(child.Pid, &status, WNOHANG, &usage);
+                if (reaped == child.Pid || (reaped < 0 && errno == ECHILD)) {
+                    child.Reaped = true;
+                    child.Status = reaped < 0 ? 255 << 8 : status;
+                    child.Usage = usage;
+                    child.EndedAt = now;
+                    // What the leader started may still be finishing (an
+                    // app's crash watcher writes its report after the app
+                    // ends): the group gets five seconds to empty.
+                    child.LingerUntil = now + 5;
+                }
+            }
+            if (child.Reaped) {
+                if (kill(-child.Pid, 0) != 0) {
+                    PushResult(L, it->first, child);
+                    lua_rawseti(L, -2, ++count);
+                    ForgetGroup(child.Pid);
+                    it = Kids().Live.erase(it);
+                    continue;
+                }
+                // Still there after the grace: a stray, reported and ended so
+                // it cannot skew the next step.
+                if (!child.Stray && now >= child.LingerUntil) {
+                    child.Stray = true;
+                    kill(-child.Pid, SIGTERM);
+                    child.StrayKillAt = now + 1;
+                } else if (child.Stray && now >= child.StrayKillAt) {
+                    kill(-child.Pid, SIGKILL);
+                    child.StrayKillAt = now + 1;
+                }
+                ++it;
                 continue;
             }
             if (child.Deadline > 0 && now >= child.Deadline && !child.TimedOut && !child.Killed) {

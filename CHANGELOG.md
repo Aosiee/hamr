@@ -23,5 +23,8 @@ The first release.
 - A step's timeout also stops cluau code that never yields.
 - Background processes in a step (`ctx:start`), `ctx:sleep` and
   `ctx:waitUntil`, free ports, unset environment variables.
+- A process group gets five seconds to empty after its leader ends before
+  what is left is a stray.
+- `hamr run --dry-run`; `--changed` asks the repository nearest the suite.
 - A step with sub-steps reports the time they spent queued apart
   (`queuedSeconds`); its budget is held to its active time.

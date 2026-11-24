@@ -34,6 +34,7 @@ run options:
   --set <name>=<value>         a suite variable; repeatable
   --out <dir>                  the output directory (default: the suite's, else .hamr)
   --force                      run even when the preflight fails
+  --dry-run                    list what would run (and why the rest would not), run nothing
   --quiet                      no live lines, only the table]]
 
 type Args = {
@@ -49,6 +50,7 @@ type Args = {
 	out: string?,
 	force: boolean,
 	quiet: boolean,
+	dryRun: boolean,
 	std: boolean,
 	rest: { string },
 }
@@ -64,6 +66,7 @@ local function parse(argv: { string }): (Args?, string?) {
 		changed = false,
 		force = false,
 		quiet = false,
+		dryRun = false,
 		std = false,
 		rest = {},
 	}
@@ -109,6 +112,8 @@ local function parse(argv: { string }): (Args?, string?) {
 			a.out = need()
 		} else if (arg == "--force") {
 			a.force = true
+		} else if (arg == "--dry-run") {
+			a.dryRun = true
 		} else if (arg == "--quiet") {
 			a.quiet = true
 		} else if (arg == "--std") {
@@ -196,8 +201,12 @@ local function revision(root: string): string? {
 // to the suite's directory.
 local function changedFiles(root: string, since: string?): ({ string }?, string?) {
 	const out: { string } = {}
+	// The nearest repository wins: a git repository inside a jj workspace
+	// (or the other way round) is the one the suite belongs to.
 	const jjCode, jjRoot = host.capture({ "jj", "root" }, root)
-	if (jjCode == 0) {
+	const gitCode, gitTop = host.capture({ "git", "rev-parse", "--show-toplevel" }, root)
+	const useJj = jjCode == 0 && (gitCode != 0 || #util.trim(jjRoot) >= #util.trim(gitTop))
+	if (useJj) {
 		const ws = util.trim(jjRoot)
 		const code, text = host.capture({ "jj", "diff", "--name-only", "--from", since || "@-", "--to", "@" }, ws)
 		if (code != 0) {
@@ -208,11 +217,10 @@ local function changedFiles(root: string, since: string?): ({ string }?, string?
 		}
 		return out, nil
 	}
-	const topCode, top = host.capture({ "git", "rev-parse", "--show-toplevel" }, root)
-	if (topCode != 0) {
+	if (gitCode != 0) {
 		return nil, "--changed needs a jj or git repository"
 	}
-	const repo = util.trim(top)
+	const repo = util.trim(gitTop)
 	const code, text = host.capture({ "git", "diff", "--name-only", since || "HEAD" }, repo)
 	if (code != 0) {
 		return nil, "git diff failed"
@@ -346,6 +354,13 @@ local function cmdRun(a: Args): number {
 	if (skipped == nil) {
 		print(`hamr: {selectErr}`)
 		return 2
+	}
+	if (a.dryRun) {
+		for (_, def in suite.steps) {
+			const reason = skipped[def.name]
+			print(string.format("  %-8s %s%s", if (reason == nil) "run" else "skip", def.name, if (reason != nil) `  ({reason})` else ""))
+		}
+		return 0
 	}
 	const tty = host.isTty(1)
 	const items, failed = preflight(suite, out)

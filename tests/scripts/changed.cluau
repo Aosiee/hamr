@@ -1,0 +1,48 @@
+// --changed against a real git repository: `hamr exec tests/scripts/changed.cluau <hamr> <dir>`.
+// A suite with a step per source folder and one with no paths; after an edit
+// under b/, only the b step and the pathless one run.
+
+return function(args: { string }): number {
+	const hamr = args[1]
+	const dir = args[2]
+	host.remove(dir)
+	host.mkdir(dir)
+	host.write(`{dir}/a/one.txt`, "a\n")
+	host.write(`{dir}/b/two.txt`, "b\n")
+	host.write(`{dir}/hamr.cluau`, [[
+const hamr = require("@hamr")
+const suite = hamr.suite("changed")
+suite:step("a", { run = { "true" }, paths = { "a/**" }, timeout = 10, budget = 1 })
+suite:step("b", { run = { "true" }, paths = { "b/**" }, timeout = 10, budget = 1 })
+suite:step("always", { run = { "true" }, timeout = 10, budget = 1 })
+return suite
+]])
+	for (_, argv in { { "git", "init", "-q" }, { "git", "add", "-A" },
+		{ "git", "-c", "user.name=hamr", "-c", "user.email=hamr@localhost", "commit", "-q", "-m", "base" } }) {
+		const code = host.capture(argv, dir)
+		if (code != 0) {
+			print(`FAIL: {table.concat(argv, " ")} exited {code}`)
+			return 1
+		}
+	}
+	host.write(`{dir}/b/two.txt`, "b changed\n")
+	const code, out = host.capture({ hamr, "run", `{dir}/hamr.cluau`, "--changed", "--dry-run" }, dir)
+	let failures = 0
+	local function expect(line: string) {
+		if (!string.find(out, line, 1, true)) {
+			print(`FAIL: the dry run has no "{line}" line:\n{out}`)
+			failures += 1
+		}
+	}
+	expect("skip     a  (unchanged)")
+	expect("run      b")
+	expect("run      always")
+	if (code != 0) {
+		print(`FAIL: the dry run exited {code}`)
+		failures += 1
+	}
+	if (failures == 0) {
+		print("changed: an edit under b/ runs b and the pathless step only")
+	}
+	return if (failures > 0) 1 else 0
+}

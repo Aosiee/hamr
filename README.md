@@ -102,7 +102,7 @@ does not load.
 
 | | |
 |---|---|
-| `hamr run [suite] [--tier T] [--only G] [--skip G] [--changed] [-j N] [--set k=v]` | run the suite (default: the nearest `hamr.cluau`) |
+| `hamr run [suite] [--tier T] [--only G] [--skip G] [--changed] [-j N] [--set k=v] [--dry-run]` | run the suite (default: the nearest `hamr.cluau`) |
 | `hamr list [suite]` | the steps with their budgets, medians and last times |
 | `hamr history [suite] [step]` | recent runs, or one step's trend |
 | `hamr check [files...]`, `hamr check --std` | Luau's type checker under cluau's strict rules |
