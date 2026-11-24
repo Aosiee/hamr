@@ -603,7 +603,13 @@ function M.execute(plan: Plan): Outcome {
 				}
 			}
 		}
+		// Exclusive steps first, back to back: each one has to drain the
+		// machine before it starts, so running them together costs one
+		// drain instead of one per step. Then the longest first.
 		table.sort(candidates, function(a: Node, b: Node): boolean {
+			if (a.exclusive != b.exclusive) {
+				return a.exclusive
+			}
 			if (a.priority != b.priority) {
 				return a.priority > b.priority
 			}

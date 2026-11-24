@@ -64,7 +64,27 @@ void ForgetGroup(pid_t pid) {
             g_Groups[i] = 0;
 }
 
+volatile double g_FirstInterrupt = 0;
+
+double SignalSafeNow() {
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+// The first interrupt ends the run cleanly (the report is still written); a
+// second one at least a second later - a person pressing Ctrl-C again -
+// kills everything at once. A second signal within the second is the same
+// interrupt delivered twice (`timeout` signals the process and its group).
 void OnSignal(int) {
+    double now = SignalSafeNow();
+    if (g_Interrupts == 0) {
+        g_FirstInterrupt = now;
+        g_Interrupts = 1;
+        return;
+    }
+    if (now - g_FirstInterrupt < 1.0)
+        return;
     g_Interrupts = g_Interrupts + 1;
     if (g_Interrupts >= 2) {
         for (int i = 0; i < kMaxGroups; i++)

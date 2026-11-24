@@ -146,8 +146,11 @@ suite:step("samples", {
 				c:fail(`four 1 s steps on -j 4 then a 0.5 s one took {r.wallSeconds} s`)
 			}
 			const alone = stepOf(r, "alone")
-			if (alone != nil && alone.startedAt < 0.9) {
-				c:fail("the exclusive step started beside the others")
+			for (i = 1, 4) {
+				const other = stepOf(r, `sleep{i}`)
+				if (alone != nil && other != nil && alone.startedAt < other.endedAt - 0.05 && other.startedAt < alone.endedAt - 0.05) {
+					c:fail(`the exclusive step ran beside sleep{i}`)
+				}
 			}
 		})
 		sample(ctx, "needs", "needs", {}, 1, function(c: Context, r: Report) {

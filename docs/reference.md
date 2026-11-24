@@ -111,9 +111,12 @@ passed) starts while its resources fit:
 - a step never waits for its own ancestors: a function step lends its share
   to its sub-steps.
 
-Ready steps start longest first, by their median time over the recent runs
-(else their budget). The long steps start early, which is what shortens the
-wall time.
+Ready exclusive steps start first, one after another: each has to drain the
+machine before it starts, so running them together costs one drain instead
+of one each. The other ready steps start longest first, by their median
+time over the recent runs (else their budget), so the long steps start
+early, which is what shortens the wall time. A sub-step without a budget of
+its own inherits its parent's priority.
 
 ## Output
 

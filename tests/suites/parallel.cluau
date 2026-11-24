@@ -1,5 +1,5 @@
 // Four one-second steps on four cores run side by side; the exclusive step
-// runs alone, after them (it is declared last and shorter).
+// runs alone (before them: ready exclusive steps go first).
 const hamr = require("@hamr")
 const suite = hamr.suite("parallel")
 
