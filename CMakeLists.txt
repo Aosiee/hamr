@@ -17,7 +17,7 @@ endif()
 set(HAMR_LUAU_DIR "" CACHE PATH "A Luau checkout to build against (default: fetch the pinned commit)")
 set(HAMR_CLUAU_DIR "" CACHE PATH "A cluau checkout to build against (default: fetch the pinned commit)")
 set(HAMR_LUAU_COMMIT 0afee00064945abbeb6e6ef2b87633564c54e176)  # Luau 0.688
-set(HAMR_CLUAU_COMMIT 8bae2b2534d624ffe780651419576cde5b1c1a49) # cluau 0.20.0
+set(HAMR_CLUAU_COMMIT 8bae2b2534d624ffe780651419576cde5b1c1a49) # cluau 0.5.0 (v0.5.0)
 
 include(FetchContent)
 if(NOT HAMR_LUAU_DIR)
