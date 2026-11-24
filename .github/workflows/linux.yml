@@ -1,6 +1,11 @@
 # Builds hamr, then has it run its own suite: a second build of itself, the
 # type checks, the unit checks and every sample suite. The report is kept as
 # an artifact.
+#
+# cluau is checked out at the commit CMakeLists.txt pins and handed to both
+# builds, so neither fetches it. While cluau's repository is private, the
+# CLUAU_TOKEN secret (a token that can read Aosiee/cluau) is what lets this
+# job check it out; once it is public, no secret is needed.
 name: Linux
 
 on:
@@ -27,16 +32,34 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: The pinned cluau commit
+        id: pins
+        run: echo "cluau=$(sed -n 's/^set(HAMR_CLUAU_COMMIT \([0-9a-f]*\).*/\1/p' CMakeLists.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Check out cluau
+        uses: actions/checkout@v5
+        with:
+          repository: Aosiee/cluau
+          ref: ${{ steps.pins.outputs.cluau }}
+          path: external/cluau
+          token: ${{ secrets.CLUAU_TOKEN || github.token }}
+
       - name: Build
         run: |
           ${{ matrix.cxx }} --version
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
-          cmake --build build -j
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.cxx }} \
+            -DHAMR_CLUAU_DIR="$GITHUB_WORKSPACE/external/cluau"
+          cmake --build build -j "$(nproc)"
 
+      # The suite builds hamr again, against the same checkouts (the first
+      # build fetched Luau into build/_deps).
       - name: Suite
         env:
           CXX: ${{ matrix.cxx }}
-        run: ./build/hamr run
+        run: >
+          ./build/hamr run
+          --set cluauDir="$GITHUB_WORKSPACE/external/cluau"
+          --set luauDir="$GITHUB_WORKSPACE/build/_deps/luau-src"
 
       - name: Report
         if: always()
