@@ -21,6 +21,8 @@ export type Finding = {
 // One process a step ran.
 export type Run = {
 	argv: { string },
+	// Seconds from the run's start.
+	startedAt: number,
 	code: number?,
 	signal: number?,
 	timedOut: boolean,
@@ -47,6 +49,10 @@ export type StepResult = {
 	startedAt: number,
 	endedAt: number,
 	seconds: number,
+	// A step with sub-steps: the part of `seconds` when neither it nor any of
+	// its sub-steps ran anything (its sub-steps waiting for resources).
+	// Budgets are held to the rest.
+	queuedSeconds: number?,
 	cpuSeconds: number,
 	peakRssMB: number,
 	budget: number?,
@@ -69,6 +75,17 @@ export type RunOptions = {
 	allowFail: boolean?,
 	// The log to write to (default: the step's own).
 	log: string?,
+	// Environment variables the process must not inherit.
+	unset: { string }?,
+}
+
+// A process a step started in the background (ctx:start).
+export type Proc = {
+	// Waits for it to end; what ctx:run returns.
+	wait: (self: Proc) -> Run,
+	// Ends its process group (SIGTERM, SIGKILL five seconds later).
+	kill: (self: Proc) -> (),
+	done: (self: Proc) -> boolean,
 }
 
 export type Context = {
@@ -80,6 +97,13 @@ export type Context = {
 	vars: { [string]: string },
 	result: StepResult,
 	run: (self: Context, command: { string }, options: RunOptions?) -> Run,
+	// Starts a process and returns at once; the step ends any it leaves running.
+	start: (self: Context, command: { string }, options: RunOptions?) -> Proc,
+	// Waits without holding up the other steps.
+	sleep: (self: Context, seconds: number) -> (),
+	// Checks `ready` every `interval` seconds (default 0.1) until it holds or
+	// `timeout` seconds pass; whether it held.
+	waitUntil: (self: Context, ready: () -> boolean, timeout: number, interval: number?) -> boolean,
 	step: (self: Context, name: string, spec: SubStepSpec) -> (),
 	wait: (self: Context) -> (),
 	finding: (self: Context, kind: string, message: string, severity: string?) -> (),

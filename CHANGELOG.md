@@ -21,3 +21,7 @@ The first release.
   the run history, the budget and regression warnings, and the end-of-run
   table with the critical path.
 - A step's timeout also stops cluau code that never yields.
+- Background processes in a step (`ctx:start`), `ctx:sleep` and
+  `ctx:waitUntil`, free ports, unset environment variables.
+- A step with sub-steps reports the time they spent queued apart
+  (`queuedSeconds`); its budget is held to its active time.

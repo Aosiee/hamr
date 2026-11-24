@@ -39,7 +39,7 @@ const kStatus = { "pass", "fail", "timeout", "blocked", "skipped", "interrupted"
 
 const finding = object({ step = str(), kind = str(), message = str(), severity = str({ "error", "warning" }) })
 const run = object({
-	argv = array(str()), code = num(), signal = num(), timedOut = bool(), seconds = num(),
+	argv = array(str()), startedAt = num(), code = num(), signal = num(), timedOut = bool(), seconds = num(),
 	cpuSeconds = num(), peakRssMB = num(), leftProcesses = bool(), log = str(),
 }, { "code", "signal" })
 const test = object({ name = str(), seconds = num(), status = str() })
@@ -48,11 +48,11 @@ const test = object({ name = str(), seconds = num(), status = str() })
 // name "step" for it.
 const step = object({
 	name = str(), tier = str({ "fast", "nightly", "manual" }), status = str(kStatus), reason = str(),
-	startedAt = num(), endedAt = num(), seconds = num(), cpuSeconds = num(), peakRssMB = num(),
+	startedAt = num(), endedAt = num(), seconds = num(), queuedSeconds = num(), cpuSeconds = num(), peakRssMB = num(),
 	budget = num(), timeout = num(), command = array(str()), log = str(),
 	findings = array(finding), runs = array(run), tests = array(test),
 	children = { kind = "step" }, meta = map(str()),
-}, { "reason", "budget", "timeout", "command", "log", "meta" })
+}, { "reason", "budget", "timeout", "command", "log", "meta", "queuedSeconds" })
 
 M.report = object({
 	schema = str({ "hamr/1" }),

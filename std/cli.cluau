@@ -393,14 +393,6 @@ local function cmdRun(a: Args): number {
 		tierBudget = if (#a.only == 0 && !a.changed) budgets[a.tier] else nil,
 	})
 	report.write(r, out, runDir)
-	for (_, hook in suite.reportHooks) {
-		const ok, hookErr = pcall(function() {
-			hook(r, runDir)
-		})
-		if (!ok) {
-			print(`hamr: a report hook failed: {hookErr}`)
-		}
-	}
 	report.printTable(r, medians, tty)
 	report.printFindings(r, tty)
 	const s = r.summary
@@ -427,6 +419,14 @@ local function cmdRun(a: Args): number {
 	print("")
 	print(`hamr: {table.concat(parts, ", ")} in {util.seconds(r.wallSeconds)}{budgetNote}; cpu {util.seconds(s.cpuSeconds)}`)
 	print(`hamr: report {host.relative(host.join(runDir, "report.json"))}`)
+	for (_, hook in suite.reportHooks) {
+		const ok, hookErr = pcall(function() {
+			hook(r, runDir)
+		})
+		if (!ok) {
+			print(`hamr: a report hook failed: {hookErr}`)
+		}
+	}
 	if (outcome.interrupted) {
 		return 130
 	}

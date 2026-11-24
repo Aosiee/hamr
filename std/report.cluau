@@ -38,6 +38,12 @@ function M.flatten(steps: { StepResult }): { StepResult } {
 	return out
 }
 
+// What a step's budget is held to: its time less what its sub-steps spent
+// queued for resources.
+function M.activeSeconds(r: StepResult): number {
+	return r.seconds - (r.queuedSeconds or 0)
+}
+
 local function ran(r: StepResult): boolean {
 	return r.status != "skipped" && r.status != "blocked" && r.status != "waiting"
 }
@@ -90,18 +96,19 @@ function M.budgetWarnings(steps: { StepResult }, medians: Medians, wall: number,
 	for (_, r in M.flatten(steps)) {
 		if (ran(r)) {
 			const budget = r.budget
-			if (budget != nil && r.seconds > budget) {
+			const took = M.activeSeconds(r)
+			if (budget != nil && took > budget) {
 				table.insert(out, { step = r.name, kind = "budget", severity = "warning",
-					message = `took {util.seconds(r.seconds)}, budget {util.seconds(budget)}` })
+					message = `took {util.seconds(took)}, budget {util.seconds(budget)}` })
 			}
 			const median = medians.seconds[r.name]
 			const samples = medians.samples[r.name] || 0
-			const doubled = budget != nil && r.seconds > 2 * budget
-			const slower = median != nil && samples >= 3 && r.seconds > median * 1.5 && r.seconds - median > 10
+			const doubled = budget != nil && took > 2 * budget
+			const slower = median != nil && samples >= 3 && took > median * 1.5 && took - median > 10
 			if (doubled || slower) {
 				const against = if (median != nil) `median {util.seconds(median)} over {samples} runs` else `budget {util.seconds(budget || 0)}`
 				table.insert(out, { step = r.name, kind = "regression", severity = "warning",
-					message = `took {util.seconds(r.seconds)} ({against})` })
+					message = `took {util.seconds(took)} ({against})` })
 			}
 		}
 	}
@@ -201,7 +208,7 @@ function M.build(a: BuildArgs): Report {
 			summary.interrupted += 1
 		}
 		summary.cpuSeconds += r.cpuSeconds
-		if (r.budget != nil && ran(r) && r.seconds > (r.budget :: number)) {
+		if (r.budget != nil && ran(r) && M.activeSeconds(r) > (r.budget :: number)) {
 			table.insert(summary.overBudget, r.name)
 		}
 		for (_, f in r.findings) {
@@ -247,7 +254,7 @@ function M.write(report: Report, out: string, runDir: string) {
 		const steps: { [string]: HistoryStep } = {}
 		for (_, r in M.flatten(report.steps)) {
 			if (ran(r)) {
-				steps[r.name] = { s = math.floor(r.seconds * 100 + 0.5) / 100, st = r.status }
+				steps[r.name] = { s = math.floor(M.activeSeconds(r) * 100 + 0.5) / 100, st = r.status }
 			}
 		}
 		const line: HistoryLine = { started = report.started, tier = report.tier, wall = report.wallSeconds, args = report.args, steps = json.object(steps) }
@@ -275,7 +282,7 @@ local function vsMedian(r: StepResult, medians: Medians): string {
 	if (median == nil || median <= 0) {
 		return "new"
 	}
-	const change = (r.seconds - median) / median * 100
+	const change = (M.activeSeconds(r) - median) / median * 100
 	return string.format("%+.0f%%", change)
 }
 
@@ -300,9 +307,13 @@ function M.printTable(report: Report, medians: Medians, tty: boolean) {
 		const share = if (depth == 0) string.format("%4.0f%%", r.seconds / wall * 100) else "     "
 		const budget = if (r.budget != nil) util.seconds(r.budget :: number) else "-"
 		const mark = if (critical[r.name] && depth == 0) "*" else " "
-		const name = string.rep("  ", depth) .. (if (depth > 0) string.match(r.name, "[^/]+$") || r.name else r.name)
+		let name = string.rep("  ", depth) .. (if (depth > 0) string.match(r.name, "[^/]+$") || r.name else r.name)
+		const queued = r.queuedSeconds
+		if (queued != nil) {
+			name ..= `  (+{util.seconds(queued)} queued)`
+		}
 		print(string.format("  %-9s %7s  %s  %6s  %5s  %6s  %6s %s%s",
-			r.status, util.seconds(r.seconds), share, util.seconds(r.cpuSeconds), megabytes(r.peakRssMB),
+			r.status, util.seconds(M.activeSeconds(r)), share, util.seconds(r.cpuSeconds), megabytes(r.peakRssMB),
 			budget, vsMedian(r, medians), mark, name))
 		const children = table.clone(r.children)
 		table.sort(children, function(a: StepResult, b: StepResult): boolean {
@@ -323,10 +334,37 @@ function M.printTable(report: Report, medians: Medians, tty: boolean) {
 			row(r, 0)
 		}
 	}
+	// What did not run: each step named while the list is short, else a
+	// count per reason (a blocked step is always named: it needs a look).
 	const notRun: { string } = {}
+	const byReason: { [string]: number } = {}
+	const reasons: { string } = {}
 	for (_, r in report.steps) {
 		if (!ran(r)) {
-			table.insert(notRun, `{r.name} ({r.status}{if (r.reason != nil) ": " .. (r.reason :: string) else ""})`)
+			const reason = `{r.status}{if (r.reason != nil) ": " .. (r.reason :: string) else ""}`
+			if (r.status == "blocked") {
+				table.insert(notRun, `{r.name} ({reason})`)
+			} else {
+				if (byReason[reason] == nil) {
+					table.insert(reasons, reason)
+				}
+				byReason[reason] = (byReason[reason] or 0) + 1
+			}
+		}
+	}
+	let others = 0
+	for (_, reason in reasons) {
+		others += byReason[reason]
+	}
+	if (others <= 6) {
+		for (_, r in report.steps) {
+			if (!ran(r) && r.status != "blocked") {
+				table.insert(notRun, `{r.name} ({r.status}{if (r.reason != nil) ": " .. (r.reason :: string) else ""})`)
+			}
+		}
+	} else {
+		for (_, reason in reasons) {
+			table.insert(notRun, `{byReason[reason]} {reason}`)
 		}
 	}
 	if (#notRun > 0) {

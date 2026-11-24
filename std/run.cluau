@@ -18,6 +18,7 @@ type RunOptions = types.RunOptions
 type SubStepSpec = types.SubStepSpec
 type Resources = types.Resources
 type Finding = types.Finding
+type Proc = types.Proc
 
 const M = {}
 
@@ -44,7 +45,10 @@ type Node = {
 	started: number,
 	result: StepResult,
 	logPath: string,
-	procResult: HostProcResult?,
+	results: { [number]: HostProcResult },
+	live: { [number]: boolean },
+	waitingOn: number?,
+	wakeAt: number?,
 }
 
 export type Plan = {
@@ -226,6 +230,35 @@ function M.execute(plan: Plan): Outcome {
 		const now = host.monotonic()
 		r.endedAt = now - t0
 		r.seconds = now - node.started
+		if (#r.children > 0) {
+			// Active = the union of its own processes' and its sub-steps'
+			// active spans; the rest of its wall time was queueing.
+			const spans: { { number } } = {}
+			for (_, run in r.runs) {
+				table.insert(spans, { run.startedAt, run.startedAt + run.seconds })
+			}
+			for (_, child in r.children) {
+				if (child.status != "skipped" && child.status != "blocked") {
+					table.insert(spans, { child.startedAt + (child.queuedSeconds or 0), child.endedAt })
+				}
+			}
+			table.sort(spans, function(a: { number }, b: { number }): boolean {
+				return a[1] < b[1]
+			})
+			let active = 0
+			let reach = -math.huge
+			for (_, span in spans) {
+				const from = math.max(span[1], reach)
+				if (span[2] > from) {
+					active += span[2] - from
+				}
+				reach = math.max(reach, span[2])
+			}
+			const queued = r.seconds - active
+			if (queued > 0.05) {
+				r.queuedSeconds = queued
+			}
+		}
 		if (r.status == "waiting" || r.status == "running") {
 			let status = "pass"
 			for (_, f in r.findings) {
@@ -277,6 +310,9 @@ function M.execute(plan: Plan): Outcome {
 			vars = suite.vars,
 			result = node.result,
 			run = function(self: Context, command: { string }, options: RunOptions?): Run {
+				return self:start(command, options):wait()
+			},
+			start = function(self: Context, command: { string }, options: RunOptions?): Proc {
 				const opts: RunOptions = options || {}
 				const log = opts.log || node.logPath
 				host.append(log, "$ " .. util.commandLine(command) .. "\n")
@@ -289,43 +325,90 @@ function M.execute(plan: Plan): Outcome {
 					argv = command,
 					cwd = opts.cwd || node.cwd,
 					env = merged(suite.options.env, node.env, opts.env),
+					unset = opts.unset,
 					log = log,
 					append = true,
 					timeout = timeout,
 				})
 				owners[id] = node
-				coroutine.yield()
-				const p = node.procResult
-				node.procResult = nil
-				assert(p != nil, "a step's coroutine was resumed before its process ended")
-				const run: Run = {
-					argv = command,
-					code = p.code,
-					signal = p.signal,
-					timedOut = p.timedOut,
-					seconds = p.seconds,
-					cpuSeconds = p.cpuSeconds,
-					peakRssMB = p.peakRssMB,
-					leftProcesses = p.leftProcesses,
-					log = log,
+				node.live[id] = true
+				const startedAt = host.monotonic() - t0
+				let finished: Run? = nil
+				const proc: Proc = {
+					wait = function(p: Proc): Run {
+						if (finished != nil) {
+							return finished
+						}
+						while (node.results[id] == nil) {
+							node.waitingOn = id
+							coroutine.yield()
+						}
+						node.waitingOn = nil
+						const r = node.results[id]
+						node.results[id] = nil
+						node.live[id] = nil
+						const run: Run = {
+							argv = command,
+							startedAt = startedAt,
+							code = r.code,
+							signal = r.signal,
+							timedOut = r.timedOut,
+							seconds = r.seconds,
+							cpuSeconds = r.cpuSeconds,
+							peakRssMB = r.peakRssMB,
+							leftProcesses = r.leftProcesses,
+							log = log,
+						}
+						table.insert(node.result.runs, run)
+						node.result.cpuSeconds += r.cpuSeconds
+						node.result.peakRssMB = math.max(node.result.peakRssMB, r.peakRssMB)
+						const line = util.commandLine(command)
+						if (r.timedOut) {
+							addFinding(node, "timeout", `{line}: timed out after {util.seconds(r.seconds)}`)
+						} else if (!opts.allowFail && !r.killed) {
+							if (r.signal != nil) {
+								addFinding(node, "exit_code", `{line}: killed by signal {r.signal}`)
+							} else if (r.code != 0) {
+								addFinding(node, "exit_code", `{line}: exited with code {r.code}`)
+							}
+						}
+						if (r.leftProcesses) {
+							addFinding(node, "stray", `{line} left processes running in its group; hamr ended them`, "warning")
+						}
+						finished = run
+						return run
+					},
+					kill = function(p: Proc) {
+						if (node.live[id]) {
+							host.kill(id)
+						}
+					},
+					done = function(p: Proc): boolean {
+						return finished != nil || node.results[id] != nil
+					},
 				}
-				table.insert(node.result.runs, run)
-				node.result.cpuSeconds += p.cpuSeconds
-				node.result.peakRssMB = math.max(node.result.peakRssMB, p.peakRssMB)
-				const line = util.commandLine(command)
-				if (p.timedOut) {
-					addFinding(node, "timeout", `{line}: timed out after {util.seconds(p.seconds)}`)
-				} else if (!opts.allowFail) {
-					if (p.signal != nil) {
-						addFinding(node, "exit_code", `{line}: killed by signal {p.signal}`)
-					} else if (p.code != 0) {
-						addFinding(node, "exit_code", `{line}: exited with code {p.code}`)
+				return proc
+			},
+			sleep = function(self: Context, seconds: number) {
+				const at = host.monotonic() + seconds
+				while (host.monotonic() < at) {
+					node.wakeAt = at
+					coroutine.yield()
+				}
+				node.wakeAt = nil
+			},
+			waitUntil = function(self: Context, ready: () -> boolean, timeout: number, interval: number?): boolean {
+				const deadline = host.monotonic() + timeout
+				while (true) {
+					if (ready()) {
+						return true
 					}
+					if (host.monotonic() >= deadline) {
+						return false
+					}
+					self:sleep(interval || 0.1)
 				}
-				if (p.leftProcesses) {
-					addFinding(node, "stray", `{line} left processes running in its group; hamr ended them`, "warning")
-				}
-				return run
+				return false
 			},
 			step = function(self: Context, name: string, spec: SubStepSpec) {
 				const child = makeNode(name, spec, node.tier, node, #nodes + 1, spec.budget, spec.timeout)
@@ -371,6 +454,18 @@ function M.execute(plan: Plan): Outcome {
 				node.body(ctx)
 			}
 			ctx:wait()
+			// A background process the step left running is ended with it.
+			for (id, _ in node.live) {
+				host.kill(id)
+				while (node.results[id] == nil) {
+					node.waitingOn = id
+					coroutine.yield()
+				}
+				node.waitingOn = nil
+				node.results[id] = nil
+				addFinding(node, "stray", "a process the step started was still running when it ended; hamr ended it", "warning")
+			}
+			node.live = {}
 			const rule = node.rule || (if (command != nil) findings.exitCode() else nil)
 			if (rule != nil) {
 				rule(node.result, ctx)
@@ -448,12 +543,16 @@ function M.execute(plan: Plan): Outcome {
 			rule = spec.findings,
 			parent = parent,
 			order = order,
-			priority = plan.medians[full] || budget || 0,
+			// A sub-step runs as soon as its parent would: it inherits the
+			// parent's priority when it has none of its own.
+			priority = plan.medians[full] || budget || (if (parent != nil) parent.priority else 0),
 			state = "waiting",
 			pending = 0,
 			waitingChildren = false,
 			started = 0,
 			result = newResult(full, tier, budget, timeout),
+			results = {},
+			live = {},
 			logPath = host.join(plan.runDir, "logs", util.fileName(full) .. ".log"),
 		}
 		node.result.log = node.logPath
@@ -555,13 +654,32 @@ function M.execute(plan: Plan): Outcome {
 			}
 			continue
 		}
-		const results, interrupted = host.poll(if (tty) 0.5 else 1)
+		// Wake the steps whose sleep is over; poll no longer than the next one.
+		let pollFor = if (tty) 0.5 else 1
+		const now = host.monotonic()
+		for (_, n in running) {
+			const at = n.wakeAt
+			if (at != nil) {
+				if (at <= now) {
+					n.wakeAt = nil
+					table.insert(wake, n)
+				} else {
+					pollFor = math.min(pollFor, at - now)
+				}
+			}
+		}
+		if (#wake > 0) {
+			continue
+		}
+		const results, interrupted = host.poll(pollFor)
 		for (_, p in results) {
 			const owner = owners[p.id]
 			if (owner != nil) {
 				owners[p.id] = nil
-				owner.procResult = p
-				table.insert(wake, owner)
+				owner.results[p.id] = p
+				if (owner.waitingOn == p.id) {
+					table.insert(wake, owner)
+				}
 			}
 		}
 		if (interrupted) {

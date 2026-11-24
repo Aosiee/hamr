@@ -10,7 +10,10 @@
 #include <csignal>
 #include <cstring>
 #include <fcntl.h>
+#include <arpa/inet.h>
 #include <map>
+#include <netinet/in.h>
+#include <sys/socket.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -111,16 +114,30 @@ int Spawn(lua_State* L) {
         }
     }
     lua_pop(L, 1);
+    lua_getfield(L, 1, "unset");
+    std::vector<std::string> unset = StringList(L, -1);
+    lua_pop(L, 1);
 
     std::vector<char*> cargv = CArgv(argv);
     double start = MonotonicSeconds();
+    // Until the child has reset hamr's handlers, a SIGTERM sent to it (a
+    // kill right after the start) would be swallowed: hold the signals
+    // across the fork, and let the child take them with the default action.
+    sigset_t hold, previous;
+    sigemptyset(&hold);
+    sigaddset(&hold, SIGINT);
+    sigaddset(&hold, SIGTERM);
+    sigprocmask(SIG_BLOCK, &hold, &previous);
     pid_t pid = fork();
-    if (pid < 0)
+    if (pid < 0) {
+        sigprocmask(SIG_SETMASK, &previous, nullptr);
         luaL_error(L, "host.spawn: fork failed: %s", std::strerror(errno));
+    }
     if (pid == 0) {
         setpgid(0, 0);
         signal(SIGINT, SIG_DFL);
         signal(SIGTERM, SIG_DFL);
+        sigprocmask(SIG_SETMASK, &previous, nullptr);
         int in = open("/dev/null", O_RDONLY);
         if (in >= 0)
             dup2(in, 0);
@@ -133,6 +150,8 @@ int Spawn(lua_State* L) {
             dprintf(2, "hamr: cannot enter %s: %s\n", cwd->c_str(), std::strerror(errno));
             _exit(127);
         }
+        for (const std::string& name : unset)
+            unsetenv(name.c_str());
         for (const auto& [key, value] : env)
             setenv(key.c_str(), value.c_str(), 1);
         execvp(cargv[0], cargv.data());
@@ -140,6 +159,7 @@ int Spawn(lua_State* L) {
         _exit(127);
     }
     setpgid(pid, pid);
+    sigprocmask(SIG_SETMASK, &previous, nullptr);
     TrackGroup(pid);
     Child child;
     child.Pid = pid;
@@ -217,7 +237,9 @@ int Poll(lua_State* L) {
             }
             ++it;
         }
-        if (count > 0 || g_Interrupts > 0 || now >= until || Kids().Live.empty())
+        // With nothing running, a timed poll still waits out its timeout (a
+        // step may be sleeping); an untimed one returns at once.
+        if (count > 0 || g_Interrupts > 0 || now >= until || (Kids().Live.empty() && timeout < 0))
             break;
         SleepSeconds(std::min(0.01, until - now));
     }
@@ -293,6 +315,29 @@ int Capture(lua_State* L) {
     return 2;
 }
 
+// host.freePort(kind?) -> a port on 127.0.0.1 nothing listens on now
+// ("udp", the default, or "tcp").
+int FreePort(lua_State* L) {
+    std::string kind = lua_isstring(L, 1) ? lua_tostring(L, 1) : "udp";
+    int fd = socket(AF_INET, kind == "tcp" ? SOCK_STREAM : SOCK_DGRAM, 0);
+    if (fd < 0)
+        luaL_error(L, "host.freePort: no socket");
+    sockaddr_in addr = {};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    socklen_t length = sizeof(addr);
+    if (bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        getsockname(fd, reinterpret_cast<sockaddr*>(&addr), &length) != 0) {
+        close(fd);
+        luaL_error(L, "host.freePort: cannot bind");
+    }
+    int port = ntohs(addr.sin_port);
+    close(fd);
+    lua_pushinteger(L, port);
+    return 1;
+}
+
 } // namespace
 
 void KillAllChildren() {
@@ -320,6 +365,7 @@ void OpenProc(lua_State* L) {
     SetFunction(L, "running", Running);
     SetFunction(L, "interrupted", Interrupted);
     SetFunction(L, "capture", Capture);
+    SetFunction(L, "freePort", FreePort);
 }
 
 } // namespace hamr

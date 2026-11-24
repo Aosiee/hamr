@@ -1,0 +1,16 @@
+// A step whose sub-step waits for a resource another step holds: its wall
+// time includes the wait, its budget is held to its active time.
+const hamr = require("@hamr")
+const suite = hamr.suite("queued")
+
+suite:step("hold", { run = { "sleep", "1" }, resources = { tags = { "x" } }, timeout = 10, budget = 10 })
+suite:step("parent", {
+	timeout = 10,
+	budget = 0.5,
+	resources = { cpu = 0 },
+	run = function(ctx: hamr.Context) {
+		ctx:step("child", { run = { "sleep", "0.2" }, resources = { tags = { "x" } } })
+	},
+})
+
+return suite

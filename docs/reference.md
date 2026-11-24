@@ -65,7 +65,9 @@ A function step gets a context:
 
 | | |
 |---|---|
-| `ctx:run(argv, options?)` | Runs a command to its end and returns its `Run` (`code`, `signal`, `timedOut`, `seconds`, `cpuSeconds`, `peakRssMB`, `leftProcesses`, `log`). A non-zero exit is an error finding unless `options.allowFail`. Options: `cwd`, `env`, `timeout`, `log` (another file than the step's log). |
+| `ctx:start(argv, options?)` | Starts a command in the background and returns a `Proc`: `proc:wait()` (its `Run`), `proc:kill()`, `proc:done()`. A process the step leaves running is ended when the step ends (a `stray` warning). |
+| `ctx:sleep(seconds)`, `ctx:waitUntil(ready, timeout, interval?)` | Wait without holding up other steps; `waitUntil` polls `ready()` and says whether it held in time. |
+| `ctx:run(argv, options?)` | Runs a command to its end and returns its `Run` (`code`, `signal`, `timedOut`, `seconds`, `cpuSeconds`, `peakRssMB`, `leftProcesses`, `log`). A non-zero exit is an error finding unless `options.allowFail`. Options: `cwd`, `env`, `unset` (variables it must not inherit), `timeout`, `log` (another file than the step's log). |
 | `ctx:step(name, spec)` | Starts a sub-step (the step fields; `budget` and `timeout` optional). It is scheduled like any step; its name is `<step>/<name>`; `needs` may name a sibling. |
 | `ctx:wait()` | Waits for the sub-steps started so far. A function step also waits for them when it returns. |
 | `ctx:finding(kind, message, severity?)` | `severity` is `error` (default) or `warning`. |
@@ -150,7 +152,7 @@ script).
 | `revision` | The jj or git revision, when there is one. |
 | `interrupted` | Whether Ctrl-C ended the run. |
 | `preflight` | `[{ severity, message }]`. |
-| `steps` | Each step, its sub-steps nested in `children`: `name`, `tier`, `status`, `reason`, `startedAt` and `endedAt` (seconds from the run's start), `seconds`, `cpuSeconds`, `peakRssMB`, `budget`, `timeout`, `command`, `log`, `findings`, `runs`, `tests` (`[{ name, seconds, status }]`), `children`, `meta`. |
+| `steps` | Each step, its sub-steps nested in `children`: `name`, `tier`, `status`, `reason`, `startedAt` and `endedAt` (seconds from the run's start), `seconds`, `queuedSeconds` (a step with sub-steps: the part of its time when nothing of it ran, its sub-steps waiting for resources; budgets are held to the rest), `cpuSeconds`, `peakRssMB`, `budget`, `timeout`, `command`, `log`, `findings`, `runs`, `tests` (`[{ name, seconds, status }]`), `children`, `meta`. |
 | `findings` | Every finding: `{ step, kind, message, severity }`. |
 | `summary` | `steps`, `passed`, `failed`, `timedOut`, `blocked`, `skipped`, `interrupted`, `errors`, `warnings`, `cpuSeconds`, `overBudget`, `criticalPath`, `tierBudget`. |
 
@@ -166,7 +168,8 @@ before each one started: a need, or the step whose resources it waited for.
 `host` is a global (declared in `types/host.d.luau`). The standard library
 wraps it; suites may call it directly:
 
-- processes: `spawn`, `poll`, `kill`, `running`, `interrupted`, `capture`;
+- processes: `spawn`, `poll`, `kill`, `running`, `interrupted`, `capture`,
+  `freePort`;
 - files: `read`, `write`, `append`, `exists`, `isDir`, `mkdir`, `remove`,
   `copy`, `list`, `glob`, `globMatch`, `stat`;
 - paths: `cwd`, `absolute`, `relative`, `join`, `parent`, `basename`,

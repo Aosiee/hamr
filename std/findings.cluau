@@ -159,7 +159,8 @@ function M.readJUnit(path: string): { JUnitCase }? {
 			message = string.match(body, "message=\"([^\"]*)\"")
 		}
 		table.insert(tests, {
-			name = if (className != nil && className != "" && className != name) `{className}.{name}` else name,
+			// A classname that is a file path (doctest) adds nothing to the name.
+			name = if (className != nil && className != "" && className != name && !string.find(className, "/", 1, true)) `{className}.{name}` else name,
 			seconds = tonumber(attribute(attrs, "time") || "0") || 0,
 			status = status,
 			message = if (message != nil) unescape(message) else nil,

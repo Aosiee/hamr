@@ -6,6 +6,7 @@ export type HostSpawnSpec = {
     argv: { string },
     cwd: string?,
     env: { [string]: string }?,
+    unset: { string }?,
     log: string?,
     append: boolean?,
     timeout: number?,
@@ -46,6 +47,8 @@ declare host: {
     running: () -> number,
     interrupted: () -> boolean,
     capture: (argv: { string }, cwd: string?) -> (number, string),
+    -- A port nothing listens on now ("udp" or "tcp" on 127.0.0.1).
+    freePort: (kind: string?) -> number,
 
     -- Files and paths.
     read: (path: string) -> string?,

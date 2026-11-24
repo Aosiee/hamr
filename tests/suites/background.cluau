@@ -1,0 +1,50 @@
+// Background processes, a sleep that holds up nothing else, waitUntil, a
+// free port and an unset environment variable.
+const hamr = require("@hamr")
+const suite = hamr.suite("background")
+
+suite:step("server", {
+	timeout = 30,
+	budget = 5,
+	run = function(ctx: hamr.Context) {
+		const marker = host.join(ctx.out, "ready")
+		const server = ctx:start({ "sh", "-c", `sleep 0.5; touch {marker}; sleep 30` })
+		if (!ctx:waitUntil(function(): boolean {
+			return host.exists(marker)
+		}, 5)) {
+			ctx:fail("the background process never wrote its marker")
+		}
+		const port = host.freePort("udp")
+		if (port <= 0) {
+			ctx:fail("no free port")
+		}
+		const env = ctx:run({ "sh", "-c", "test -z \"$HAMR_UNSET_ME\"" }, { env = {}, unset = { "HAMR_UNSET_ME" } })
+		if (env.code != 0) {
+			ctx:fail("an unset variable reached the process")
+		}
+		server:kill()
+		const r = server:wait()
+		if (r.code == 0) {
+			ctx:fail("the killed background process exited 0")
+		}
+	},
+})
+// Runs while "server" sleeps and waits.
+suite:step("beside", {
+	timeout = 30,
+	budget = 5,
+	run = function(ctx: hamr.Context) {
+		ctx:sleep(0.3)
+		ctx:run({ "true" })
+	},
+})
+// Leaves a background process running: hamr ends it with a warning.
+suite:step("leaves", {
+	timeout = 30,
+	budget = 5,
+	run = function(ctx: hamr.Context) {
+		ctx:start({ "sleep", "34.4" })
+	},
+})
+
+return suite

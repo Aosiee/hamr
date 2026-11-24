@@ -106,7 +106,7 @@ type Check = (ctx: Context, r: Report) -> ()
 
 // Runs a sample suite with the new hamr and checks its exit code and
 // report.
-local function sample(parent: Context, name: string, file: string, extra: { string }, expectCode: number, check: Check) {
+local function sample(parent: Context, name: string, file: string, extra: { string }, expectCode: number, check: Check, env: { [string]: string }?) {
 	parent:step(name, {
 		resources = { cpu = 4 },
 		run = function(ctx: Context) {
@@ -115,7 +115,7 @@ local function sample(parent: Context, name: string, file: string, extra: { stri
 			for (_, arg in extra) {
 				table.insert(argv, arg)
 			}
-			const run = ctx:run(argv, { allowFail = true })
+			const run = ctx:run(argv, { allowFail = true, env = env })
 			if (run.code != expectCode) {
 				ctx:fail(`exited with code {run.code}, expected {expectCode}`)
 			}
@@ -238,6 +238,30 @@ suite:step("samples", {
 				c:fail(`the spinning step ran {s.seconds} s past a 1 s timeout`)
 			}
 		})
+		sample(ctx, "background", "background", {}, 0, function(c: Context, r: Report) {
+			expectStatus(c, r, "server", "pass")
+			expectStatus(c, r, "beside", "pass")
+			const beside = stepOf(r, "beside")
+			if (beside != nil && beside.startedAt > 0.3) {
+				c:fail("a sleeping step held up the step beside it")
+			}
+			const leaves = stepOf(r, "leaves")
+			if (leaves != nil && (leaves.seconds > 2 || #leaves.findings != 1 || leaves.findings[1].kind != "stray")) {
+				c:fail("the process a step left running was not ended at once with a stray warning")
+			}
+			if (processRunning("sleep 34.4")) {
+				c:fail("the background process survived its step")
+			}
+		}, { HAMR_UNSET_ME = "1" })
+		sample(ctx, "queued", "queued", {}, 0, function(c: Context, r: Report) {
+			const parent = stepOf(r, "parent")
+			if (parent == nil || (parent.queuedSeconds or 0) < 0.6) {
+				c:fail(`the parent's queued time is {if (parent != nil) parent.queuedSeconds or 0 else "missing"}, expected about 1 s`)
+			}
+			if (parent != nil && #parent.findings != 0) {
+				c:fail("a step whose sub-step only queued was held to its wall time")
+			}
+		})
 		sample(ctx, "nightly", "resources", { "--tier", "nightly" }, 0, function(c: Context, r: Report) {
 			expectStatus(c, r, "later", "pass")
 		})
@@ -250,7 +274,7 @@ suite:step("samples", {
 			resources = { cpu = 1 },
 			run = function(c: Context) {
 				const out = host.join(c.out, "samples", "interrupt")
-				const run = c:run({ "timeout", "--preserve-status", "-s", "INT", "1.5", bin, "run", "tests/suites/slow.cluau", "--out", out, "--quiet" }, { allowFail = true })
+				const run = c:run({ "timeout", "--preserve-status", "-s", "INT", "3", bin, "run", "tests/suites/slow.cluau", "--out", out, "--quiet" }, { allowFail = true })
 				if (run.code != 130) {
 					c:fail(`an interrupted run exited with code {run.code}, expected 130`)
 				}

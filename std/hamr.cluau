@@ -25,6 +25,7 @@ export type Preflight = types.Preflight
 export type Resources = types.Resources
 export type Report = types.Report
 export type ReportHook = types.ReportHook
+export type Proc = types.Proc
 
 const M = {
 	version = host.version,
