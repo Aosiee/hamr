@@ -3,9 +3,7 @@
 # an artifact.
 #
 # cluau is checked out at the commit CMakeLists.txt pins and handed to both
-# builds, so neither fetches it. While cluau's repository is private, the
-# CLUAU_TOKEN secret (a token that can read Aosiee/cluau) is what lets this
-# job check it out; once it is public, no secret is needed.
+# builds, so neither fetches it.
 name: Linux
 
 on:
@@ -42,7 +40,6 @@ jobs:
           repository: Aosiee/cluau
           ref: ${{ steps.pins.outputs.cluau }}
           path: external/cluau
-          token: ${{ secrets.CLUAU_TOKEN || github.token }}
 
       - name: Build
         run: |
