@@ -1,0 +1,635 @@
+// hamr's command line: run, list, check, history, exec.
+
+const types = require("@hamr/types")
+const suiteLib = require("@hamr/suite")
+const run = require("@hamr/run")
+const report = require("@hamr/report")
+const util = require("@hamr/util")
+const schema = require("@hamr/schema")
+type Suite = types.Suite
+type StepDef = types.StepDef
+type Preflight = types.Preflight
+type PreflightItem = report.PreflightItem
+
+const M = {}
+
+const kUsage = "hamr " .. host.version .. [[ - a test runner scripted in cluau
+
+usage:
+  hamr run [suite.cluau] [options]   run a suite (default: the nearest hamr.cluau)
+  hamr list [suite.cluau]            the steps, their budgets and recent times
+  hamr history [suite.cluau] [step]  recent runs, or one step's trend
+  hamr check [file.cluau ...]        type-check a suite (or files) under cluau's strict rules
+  hamr check --std                   type-check hamr's standard library
+  hamr exec <script.cluau> [args]    run a cluau script (its module may return a function of the args)
+  hamr validate <report.json> ...    check reports against the hamr/1 schema
+
+run options:
+  --tier fast|nightly|manual   the steps of that tier and the tiers below it (default fast)
+  --only <glob>                only the matching steps (and what they need); repeatable
+  --skip <glob>                not the matching steps; what needs them still runs; repeatable
+  --changed                    only the steps whose paths changed in the working copy
+  --since <rev>                like --changed, against <rev>
+  -j, --jobs <n>               the core budget (default: every core)
+  --set <name>=<value>         a suite variable; repeatable
+  --out <dir>                  the output directory (default: the suite's, else .hamr)
+  --force                      run even when the preflight fails
+  --quiet                      no live lines, only the table]]
+
+type Args = {
+	command: string,
+	argv: { string },
+	positional: { string },
+	tier: string,
+	only: { string },
+	skip: { string },
+	changed: boolean,
+	since: string?,
+	jobs: number?,
+	out: string?,
+	force: boolean,
+	quiet: boolean,
+	std: boolean,
+	rest: { string },
+}
+
+local function parse(argv: { string }): (Args?, string?) {
+	const a: Args = {
+		command = argv[1] || "help",
+		argv = argv,
+		positional = {},
+		tier = "fast",
+		only = {},
+		skip = {},
+		changed = false,
+		force = false,
+		quiet = false,
+		std = false,
+		rest = {},
+	}
+	let i = 2
+	if (a.command == "exec") {
+		a.positional = { argv[2] }
+		for (j = 3, #argv) {
+			table.insert(a.rest, argv[j])
+		}
+		return a, nil
+	}
+	while (i <= #argv) {
+		const arg = argv[i]
+		const value = argv[i + 1]
+		local function need(): string? {
+			i += 1
+			return value
+		}
+		if (arg == "--tier") {
+			a.tier = need() || ""
+		} else if (arg == "--only") {
+			table.insert(a.only, need() || "")
+		} else if (arg == "--skip") {
+			table.insert(a.skip, need() || "")
+		} else if (arg == "--changed") {
+			a.changed = true
+		} else if (arg == "--since") {
+			a.changed = true
+			a.since = need()
+		} else if (arg == "-j" || arg == "--jobs") {
+			a.jobs = tonumber(need() || "")
+			if (a.jobs == nil) {
+				return nil, `{arg} needs a number`
+			}
+		} else if (arg == "--set") {
+			const pair = need() || ""
+			const name, v = string.match(pair, "^([^=]+)=(.*)$")
+			if (name == nil || v == nil) {
+				return nil, `--set needs <name>=<value>, not "{pair}"`
+			}
+			suiteLib.setOverride(name, v)
+		} else if (arg == "--out") {
+			a.out = need()
+		} else if (arg == "--force") {
+			a.force = true
+		} else if (arg == "--quiet") {
+			a.quiet = true
+		} else if (arg == "--std") {
+			a.std = true
+		} else if (util.startsWith(arg, "-")) {
+			return nil, `unknown option {arg}`
+		} else {
+			table.insert(a.positional, arg)
+		}
+		i += 1
+	}
+	if (suiteLib.tierRank(a.tier) == 0) {
+		return nil, `unknown tier "{a.tier}" (fast, nightly or manual)`
+	}
+	return a, nil
+}
+
+local function findSuite(given: string?): string? {
+	if (given != nil) {
+		return host.absolute(given)
+	}
+	let dir = host.cwd()
+	while (true) {
+		const candidate = host.join(dir, "hamr.cluau")
+		if (host.exists(candidate)) {
+			return candidate
+		}
+		const up = host.parent(dir)
+		if (up == dir || up == "") {
+			return nil
+		}
+		dir = up
+	}
+	return nil
+}
+
+local function loadSuite(given: string?): (Suite?, string?) {
+	const path = findSuite(given)
+	if (path == nil) {
+		return nil, "no hamr.cluau here or in any parent directory (or name a suite file)"
+	}
+	if (!host.exists(path)) {
+		return nil, `no suite at {path}`
+	}
+	const ok, err = pcall(host.require, path)
+	if (!ok) {
+		return nil, tostring(err)
+	}
+	const suite = suiteLib.lastDeclared()
+	if (suite == nil) {
+		return nil, `{path} declares no suite (hamr.suite(...))`
+	}
+	suite.file = path
+	suite.root = host.parent(path)
+	return suite, nil
+}
+
+// --out is relative to the current directory; the suite's own `out`, to
+// the suite.
+local function outDir(suite: Suite, given: string?): string {
+	if (given != nil) {
+		return host.absolute(given)
+	}
+	const out = suite.options.out || ".hamr"
+	if (util.startsWith(out, "/")) {
+		return out
+	}
+	return host.join(suite.root, out)
+}
+
+local function revision(root: string): string? {
+	const code, out = host.capture({ "jj", "log", "-r", "@", "--no-graph", "--ignore-working-copy", "-T", "commit_id.short(12)" }, root)
+	if (code == 0 && util.trim(out) != "") {
+		return util.trim(out)
+	}
+	const gitCode, gitOut = host.capture({ "git", "rev-parse", "--short=12", "HEAD" }, root)
+	if (gitCode == 0) {
+		return util.trim(gitOut)
+	}
+	return nil
+}
+
+// The files changed in the working copy (jj: against `since`, default
+// @-; git: against `since`, default HEAD, plus untracked files), relative
+// to the suite's directory.
+local function changedFiles(root: string, since: string?): ({ string }?, string?) {
+	const out: { string } = {}
+	const jjCode, jjRoot = host.capture({ "jj", "root" }, root)
+	if (jjCode == 0) {
+		const ws = util.trim(jjRoot)
+		const code, text = host.capture({ "jj", "diff", "--name-only", "--from", since || "@-", "--to", "@" }, ws)
+		if (code != 0) {
+			return nil, "jj diff failed"
+		}
+		for (_, line in util.lines(text)) {
+			table.insert(out, host.relative(host.join(ws, line), root))
+		}
+		return out, nil
+	}
+	const topCode, top = host.capture({ "git", "rev-parse", "--show-toplevel" }, root)
+	if (topCode != 0) {
+		return nil, "--changed needs a jj or git repository"
+	}
+	const repo = util.trim(top)
+	const code, text = host.capture({ "git", "diff", "--name-only", since || "HEAD" }, repo)
+	if (code != 0) {
+		return nil, "git diff failed"
+	}
+	const _, untracked = host.capture({ "git", "ls-files", "--others", "--exclude-standard" }, repo)
+	for (_, line in util.lines(text .. "\n" .. untracked)) {
+		if (line != "") {
+			table.insert(out, host.relative(host.join(repo, line), root))
+		}
+	}
+	return out, nil
+}
+
+// Which top-level steps run: the tier (or --only), minus --skip, minus
+// unchanged steps; then everything a chosen step needs, unless skipped.
+local function select(suite: Suite, a: Args): ({ [string]: string }?, string?) {
+	const rank = suiteLib.tierRank(a.tier)
+	let changed: { string }? = nil
+	if (a.changed) {
+		const files, err = changedFiles(suite.root, a.since)
+		if (files == nil) {
+			return nil, err
+		}
+		changed = files
+	}
+	const chosen: { [string]: boolean } = {}
+	const skipped: { [string]: string } = {}
+	for (_, def in suite.steps) {
+		const tier = def.spec.tier || "fast"
+		let reason: string? = nil
+		if (util.matchesAny(a.skip, def.name)) {
+			reason = "--skip"
+		} else if (#a.only > 0) {
+			if (!util.matchesAny(a.only, def.name)) {
+				reason = "not in --only"
+			}
+		} else if (suiteLib.tierRank(tier) > rank) {
+			reason = `{tier} tier`
+		}
+		const paths = def.spec.paths
+		if (reason == nil && changed != nil && paths != nil) {
+			let touched = false
+			for (_, file in changed) {
+				if (util.matchesAny(paths, file)) {
+					touched = true
+					break
+				}
+			}
+			if (!touched) {
+				reason = "unchanged"
+			}
+		}
+		if (reason == nil) {
+			chosen[def.name] = true
+		} else {
+			skipped[def.name] = reason
+		}
+	}
+	// What the chosen steps need runs too (declared needs come first).
+	for (i = #suite.steps, 1, -1) {
+		const def = suite.steps[i]
+		if (chosen[def.name]) {
+			const needs: { string } = def.spec.needs || {}
+			for (_, need in needs) {
+				if (skipped[need] != nil && skipped[need] != "--skip") {
+					skipped[need] = nil
+					chosen[need] = true
+				}
+			}
+		}
+	}
+	return skipped, nil
+}
+
+local function preflight(suite: Suite, out: string): ({ PreflightItem }, boolean) {
+	const items: { PreflightItem } = {}
+	let failed = false
+	const mem = host.memory()
+	if (mem.availableMB > 0 && mem.availableMB < 2048) {
+		table.insert(items, { severity = "warning", message = `only {math.floor(mem.availableMB)} MB of memory available` })
+	}
+	host.mkdir(out)
+	const disk = host.diskFreeMB(out)
+	if (disk != nil && disk < 5120) {
+		table.insert(items, { severity = "warning", message = `only {math.floor(disk)} MB free on the output's disk` })
+	}
+	if (#suite.strayNames > 0) {
+		const me = host.pid()
+		for (_, p in host.processes()) {
+			for (_, name in suite.strayNames) {
+				// /proc truncates a process name to 15 bytes.
+				if (p.pid != me && p.name == string.sub(name, 1, 15)) {
+					table.insert(items, { severity = "warning",
+						message = `{name} is already running (pid {p.pid}, since {string.sub(host.isoTime(p.started), 12)}); it may skew or fail the run` })
+				}
+			}
+		}
+	}
+	const p: Preflight = {
+		warn = function(self: Preflight, message: string) {
+			table.insert(items, { severity = "warning", message = message })
+		},
+		fail = function(self: Preflight, message: string) {
+			table.insert(items, { severity = "error", message = message })
+			failed = true
+		},
+	}
+	for (_, check in suite.preflights) {
+		const ok, err = pcall(function() {
+			check(p)
+		})
+		if (!ok) {
+			p:fail(`a preflight check failed: {err}`)
+		}
+	}
+	return items, failed
+}
+
+local function stamp(): string {
+	return (string.gsub(host.isoTime(), ":", "-")) .. "_" .. tostring(host.pid())
+}
+
+local function cmdRun(a: Args): number {
+	const suite, err = loadSuite(a.positional[1])
+	if (suite == nil) {
+		print(`hamr: {err}`)
+		return 2
+	}
+	const out = outDir(suite, a.out)
+	const skipped, selectErr = select(suite, a)
+	if (skipped == nil) {
+		print(`hamr: {selectErr}`)
+		return 2
+	}
+	const tty = host.isTty(1)
+	const items, failed = preflight(suite, out)
+	for (_, item in items) {
+		print(`preflight {item.severity}: {item.message}`)
+	}
+	if (failed && !a.force) {
+		print("hamr: the preflight failed (--force runs anyway)")
+		return 2
+	}
+	const history = report.readHistory(out)
+	const medians = report.medians(history)
+	const jobs = a.jobs || host.cores()
+	const runDir = host.join(out, "runs", stamp())
+	let count = 0
+	for (_, def in suite.steps) {
+		if (skipped[def.name] == nil) {
+			count += 1
+		}
+	}
+	print(`hamr: {suite.name}, {a.tier} tier, {count} of {#suite.steps} steps, -j {jobs}`)
+	const startedUnix = host.now()
+	const outcome = run.execute({
+		suite = suite,
+		selected = {},
+		skipped = skipped,
+		jobs = jobs,
+		runDir = runDir,
+		medians = medians.seconds,
+		quiet = a.quiet,
+	})
+	const budgets: { [string]: number } = suite.options.budgets || {}
+	const r = report.build({
+		suite = suite.name,
+		tier = a.tier,
+		startedUnix = startedUnix,
+		wall = outcome.wall,
+		args = a.argv,
+		jobs = jobs,
+		interrupted = outcome.interrupted,
+		preflight = items,
+		steps = outcome.steps,
+		revision = revision(suite.root),
+		medians = medians,
+		tierBudget = if (#a.only == 0 && !a.changed) budgets[a.tier] else nil,
+	})
+	report.write(r, out, runDir)
+	for (_, hook in suite.reportHooks) {
+		const ok, hookErr = pcall(function() {
+			hook(r, runDir)
+		})
+		if (!ok) {
+			print(`hamr: a report hook failed: {hookErr}`)
+		}
+	}
+	report.printTable(r, medians, tty)
+	report.printFindings(r, tty)
+	const s = r.summary
+	const parts = { `{s.passed} passed` }
+	if (s.failed > 0) {
+		table.insert(parts, `{s.failed} failed`)
+	}
+	if (s.timedOut > 0) {
+		table.insert(parts, `{s.timedOut} timed out`)
+	}
+	if (s.blocked > 0) {
+		table.insert(parts, `{s.blocked} blocked`)
+	}
+	if (s.skipped > 0) {
+		table.insert(parts, `{s.skipped} not run`)
+	}
+	if (s.warnings > 0) {
+		table.insert(parts, `{s.warnings} warnings`)
+	}
+	let budgetNote = ""
+	if (s.tierBudget != nil) {
+		budgetNote = ` (budget {util.seconds(s.tierBudget :: number)})`
+	}
+	print("")
+	print(`hamr: {table.concat(parts, ", ")} in {util.seconds(r.wallSeconds)}{budgetNote}; cpu {util.seconds(s.cpuSeconds)}`)
+	print(`hamr: report {host.relative(host.join(runDir, "report.json"))}`)
+	if (outcome.interrupted) {
+		return 130
+	}
+	if (s.errors > 0 || s.failed > 0 || s.timedOut > 0 || s.blocked > 0) {
+		return 1
+	}
+	return 0
+}
+
+local function cmdList(a: Args): number {
+	const suite, err = loadSuite(a.positional[1])
+	if (suite == nil) {
+		print(`hamr: {err}`)
+		return 2
+	}
+	const history = report.readHistory(outDir(suite, a.out))
+	const medians = report.medians(history)
+	const lastRun = history[#history]
+	const totals: { [string]: number } = {}
+	print(string.format("  %-8s %7s %8s %7s %7s  %s", "tier", "budget", "timeout", "median", "last", "step"))
+	for (_, def in suite.steps) {
+		const spec = def.spec
+		const tier = spec.tier || "fast"
+		const median = medians.seconds[def.name]
+		const last = if (lastRun != nil) lastRun.steps[def.name] else nil
+		totals[tier] = (totals[tier] || 0) + (median || spec.budget)
+		let notes: { string } = {}
+		const res = spec.resources
+		if (res != nil && res.exclusive) {
+			table.insert(notes, "exclusive")
+		}
+		if (spec.needs != nil && #spec.needs > 0) {
+			table.insert(notes, "needs " .. table.concat(spec.needs, ", "))
+		}
+		print(string.format("  %-8s %7s %8s %7s %7s  %s%s", tier, util.seconds(spec.budget), util.seconds(spec.timeout),
+			if (median != nil) util.seconds(median) else "-", if (last != nil) util.seconds(last.s) else "-", def.name,
+			if (#notes > 0) "  (" .. table.concat(notes, "; ") .. ")" else ""))
+	}
+	print("")
+	for (_, tier in { "fast", "nightly", "manual" }) {
+		if (totals[tier] != nil) {
+			print(`  {tier}: about {util.seconds(totals[tier])} of step time (medians, else budgets)`)
+		}
+	}
+	const budgets: { [string]: number } = suite.options.budgets || {}
+	for (tier, seconds in budgets) {
+		print(`  {tier} budget: {util.seconds(seconds)} wall`)
+	}
+	return 0
+}
+
+local function cmdHistory(a: Args): number {
+	const suite, err = loadSuite(if (a.positional[1] != nil && string.find(a.positional[1], "%.cluau$")) a.positional[1] else nil)
+	if (suite == nil) {
+		print(`hamr: {err}`)
+		return 2
+	}
+	const step = if (a.positional[1] != nil && !string.find(a.positional[1], "%.cluau$")) a.positional[1] else a.positional[2]
+	const history = report.readHistory(outDir(suite, a.out))
+	if (#history == 0) {
+		print("hamr: no runs recorded yet")
+		return 0
+	}
+	const values: { number } = {}
+	for (_, line in history) {
+		if (step != nil) {
+			const s = line.steps[step]
+			if (s != nil) {
+				table.insert(values, s.s)
+				print(string.format("  %s  %-8s %7s  %s", line.started, line.tier, util.seconds(s.s), s.st))
+			}
+		} else {
+			let passed = 0
+			let failed = 0
+			for (_, s in line.steps) {
+				if (s.st == "pass") {
+					passed += 1
+				} else {
+					failed += 1
+				}
+			}
+			table.insert(values, line.wall)
+			print(string.format("  %s  %-8s %7s  %d passed, %d not", line.started, line.tier, util.seconds(line.wall), passed, failed))
+		}
+	}
+	if (#values > 1) {
+		print("")
+		print(`  {util.sparkline(values)}  {step || "wall time"}, oldest to newest`)
+	}
+	return 0
+}
+
+local function cmdCheck(a: Args): number {
+	let modules: { string } = {}
+	if (a.std) {
+		modules = host.stdModules()
+	} else if (#a.positional > 0) {
+		for (_, p in a.positional) {
+			table.insert(modules, host.absolute(p))
+		}
+	} else {
+		const path = findSuite(nil)
+		if (path == nil) {
+			print("hamr: no hamr.cluau here or in any parent directory (or name the files)")
+			return 2
+		}
+		table.insert(modules, path)
+	}
+	const found = host.check(modules)
+	let errors = 0
+	let warnings = 0
+	for (_, f in found) {
+		const where = if (util.startsWith(f.file, "@")) f.file else host.relative(f.file)
+		print(`{where}:{f.line}:{f.col}: {if (f.warning) "warning" else "error"} {f.code}: {f.message}`)
+		if (f.warning) {
+			warnings += 1
+		} else {
+			errors += 1
+		}
+	}
+	print(`hamr check: {#modules} module(s), {errors} error(s), {warnings} warning(s)`)
+	return if (errors > 0) 1 else 0
+}
+
+local function cmdValidate(a: Args): number {
+	if (#a.positional == 0) {
+		print("hamr validate: name a report.json")
+		return 2
+	}
+	let bad = 0
+	for (_, file in a.positional) {
+		const text = host.read(file)
+		if (text == nil) {
+			print(`{file}: cannot read it`)
+			bad += 1
+			continue
+		}
+		const value, err = host.jsonDecode(text)
+		if (err != nil) {
+			print(`{file}: {err}`)
+			bad += 1
+			continue
+		}
+		const problems = schema.validate(value)
+		for (_, problem in problems) {
+			print(`{file}: {problem}`)
+		}
+		if (#problems > 0) {
+			bad += 1
+		} else {
+			print(`{file}: a valid hamr/1 report`)
+		}
+	}
+	return if (bad > 0) 1 else 0
+}
+
+local function cmdExec(a: Args): number {
+	const script = a.positional[1]
+	if (script == nil) {
+		print("hamr exec: name a script")
+		return 2
+	}
+	const value: any = host.require(host.absolute(script)) // allow-any: a script's module value is whatever it returns
+	if (type(value) == "function") { // allow-any: the value is the script's own
+		const result: any = value(a.rest) // allow-any: the script's function returns its exit code, or nothing
+		if (type(result) == "number") { // allow-any: the result is refined to a number here
+			return result
+		}
+	}
+	return 0
+}
+
+function M.main(argv: { string }): number {
+	const a, err = parse(argv)
+	if (a == nil) {
+		print(`hamr: {err}`)
+		print("")
+		print(kUsage)
+		return 2
+	}
+	if (a.command == "run") {
+		return cmdRun(a)
+	} else if (a.command == "list") {
+		return cmdList(a)
+	} else if (a.command == "history") {
+		return cmdHistory(a)
+	} else if (a.command == "check") {
+		return cmdCheck(a)
+	} else if (a.command == "exec") {
+		return cmdExec(a)
+	} else if (a.command == "validate") {
+		return cmdValidate(a)
+	} else if (a.command == "version" || a.command == "--version") {
+		print(`hamr {host.version}`)
+		return 0
+	} else if (a.command == "help" || a.command == "--help" || a.command == "-h") {
+		print(kUsage)
+		return 0
+	}
+	print(`hamr: unknown command "{a.command}"`)
+	print("")
+	print(kUsage)
+	return 2
+}
+
+return M

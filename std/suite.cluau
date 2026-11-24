@@ -1,0 +1,123 @@
+// Suites: what a project's hamr.cluau declares. Declaring checks each step
+// at once, so a suite with a missing budget or an unknown need fails when
+// it loads, before anything runs.
+
+const types = require("@hamr/types")
+type Suite = types.Suite
+type StepSpec = types.StepSpec
+type SuiteOptions = types.SuiteOptions
+type Preflight = types.Preflight
+type ReportHook = types.ReportHook
+
+const M = {}
+
+const kTiers = { "fast", "nightly", "manual" }
+
+// The command line's --set values, applied by suite:var. The command line
+// sets them before it loads the suite.
+const overrides: { [string]: string } = {}
+const declared: { Suite } = {}
+
+function M.setOverride(name: string, value: string) {
+	overrides[name] = value
+}
+
+function M.tierRank(tier: string): number {
+	for (i, name in kTiers) {
+		if (name == tier) {
+			return i
+		}
+	}
+	return 0
+}
+
+local function addStep(self: Suite, name: string, spec: StepSpec) {
+	if (self.byName[name] != nil) {
+		error(`step "{name}" is declared twice`, 2)
+	}
+	if (string.find(name, "/", 1, true)) {
+		error(`step "{name}": a "/" separates a sub-step from its parent; name the step without one`, 2)
+	}
+	if (type(spec.budget) != "number" || spec.budget <= 0) {
+		error(`step "{name}" has no budget (seconds it may take)`, 2)
+	}
+	if (type(spec.timeout) != "number" || spec.timeout <= 0) {
+		error(`step "{name}" has no timeout (seconds before it is killed)`, 2)
+	}
+	const tier = spec.tier || "fast"
+	if (M.tierRank(tier) == 0) {
+		error(`step "{name}": unknown tier "{tier}" (fast, nightly or manual)`, 2)
+	}
+	const needs: { string } = spec.needs || {}
+	for (_, need in needs) {
+		if (self.byName[need] == nil) {
+			error(`step "{name}" needs "{need}", which is not declared before it`, 2)
+		}
+	}
+	const run = spec.run
+	if (type(run) == "table") {
+		if (#run == 0) {
+			error(`step "{name}": an empty command`, 2)
+		}
+		for (_, arg in run) {
+			for (var in string.gmatch(arg, "{([%w_]+)}")) {
+				if (self.vars[var] == nil) {
+					error(`step "{name}": "{arg}" names the variable "{var}", which the suite does not declare (suite:var)`, 2)
+				}
+			}
+		}
+	}
+	const def = { name = name, spec = spec, index = #self.steps + 1 }
+	table.insert(self.steps, def)
+	self.byName[name] = def
+}
+
+local function addPreflight(self: Suite, check: (p: Preflight) -> ()) {
+	table.insert(self.preflights, check)
+}
+
+local function addStrays(self: Suite, names: { string }) {
+	for (_, name in names) {
+		table.insert(self.strayNames, name)
+	}
+}
+
+local function addReportHook(self: Suite, hook: ReportHook) {
+	table.insert(self.reportHooks, hook)
+}
+
+local function declareVar(self: Suite, name: string, default: string): string {
+	const value = overrides[name] || default
+	self.vars[name] = value
+	return value
+}
+
+function M.new(name: string, options: SuiteOptions?): Suite {
+	const suite: Suite = {
+		name = name,
+		root = "",
+		file = "",
+		options = options || {},
+		steps = {},
+		byName = {},
+		preflights = {},
+		strayNames = {},
+		reportHooks = {},
+		vars = {},
+		step = addStep,
+		preflight = addPreflight,
+		strays = addStrays,
+		var = declareVar,
+		onReport = addReportHook,
+	}
+	table.insert(declared, suite)
+	return suite
+}
+
+// The suite a file declared: its module value, or the last suite created
+// while it loaded.
+function M.lastDeclared(): Suite? {
+	return declared[#declared]
+}
+
+return M

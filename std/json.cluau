@@ -1,0 +1,44 @@
+// JSON over the host's encoder. An empty table encodes as `[]`; mark one
+// that must be an object with json.object.
+
+const M = {}
+
+function M.encode(value: unknown, indent: number?): string {
+	return host.jsonEncode(value, indent)
+}
+
+function M.decode(text: string): (unknown, string?) {
+	return host.jsonDecode(text)
+}
+
+function M.array<T>(list: { T }): { T } {
+	return host.jsonMark(list, "array")
+}
+
+function M.object<V>(map: { [string]: V }): { [string]: V } {
+	return host.jsonMark(map, "object")
+}
+
+// Reads a JSON file hamr (or a tool the caller trusts) wrote, as the shape
+// the caller names. nil when the file is missing or is not JSON.
+function M.readAs<T>(path: string): T? {
+	const text = host.read(path)
+	if (text == nil) {
+		return nil
+	}
+	const value: any, err = host.jsonDecode(text) // allow-any: the file's writer defines its shape; the caller names it
+	if (err != nil) {
+		return nil
+	}
+	return value // allow-any: see above
+}
+
+function M.decodeAs<T>(text: string): T? {
+	const value: any, err = host.jsonDecode(text) // allow-any: the text's writer defines its shape; the caller names it
+	if (err != nil) {
+		return nil
+	}
+	return value // allow-any: see above
+}
+
+return M

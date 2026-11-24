@@ -1,0 +1,8 @@
+// A step over its timeout is ended with its whole process group, including
+// what it started in the background.
+const hamr = require("@hamr")
+const suite = hamr.suite("timeout")
+
+suite:step("hangs", { run = { "sh", "-c", "sleep 31.7 & sleep 31.7" }, timeout = 1, budget = 1 })
+
+return suite

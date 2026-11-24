@@ -1,0 +1,46 @@
+# Builds hamr, then has it run its own suite: a second build of itself, the
+# type checks, the unit checks and every sample suite. The report is kept as
+# an artifact.
+name: Linux
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: linux-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  suite:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: gcc, cxx: g++ }
+          - { name: clang, cxx: clang++ }
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build
+        run: |
+          ${{ matrix.cxx }} --version
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=${{ matrix.cxx }}
+          cmake --build build -j
+
+      - name: Suite
+        env:
+          CXX: ${{ matrix.cxx }}
+        run: ./build/hamr run
+
+      - name: Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hamr-report-${{ matrix.name }}
+          path: .hamr/latest.json

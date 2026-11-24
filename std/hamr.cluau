@@ -1,0 +1,40 @@
+// require("@hamr"): what a suite uses.
+//
+//     const hamr = require("@hamr")
+//     const suite = hamr.suite("MyProject", { budgets = { fast = 600 } })
+//     suite:step("unit", { run = { "ctest", "--test-dir", "build" }, timeout = 300, budget = 60 })
+//     return suite
+
+const types = require("@hamr/types")
+const suiteLib = require("@hamr/suite")
+const findings = require("@hamr/findings")
+const json = require("@hamr/json")
+const util = require("@hamr/util")
+
+export type Suite = types.Suite
+export type SuiteOptions = types.SuiteOptions
+export type StepSpec = types.StepSpec
+export type SubStepSpec = types.SubStepSpec
+export type Context = types.Context
+export type Rule = types.Rule
+export type Run = types.Run
+export type RunOptions = types.RunOptions
+export type StepResult = types.StepResult
+export type Finding = types.Finding
+export type Preflight = types.Preflight
+export type Resources = types.Resources
+export type Report = types.Report
+export type ReportHook = types.ReportHook
+
+const M = {
+	version = host.version,
+	findings = findings,
+	json = json,
+	util = util,
+}
+
+function M.suite(name: string, options: SuiteOptions?): Suite {
+	return suiteLib.new(name, options)
+}
+
+return M

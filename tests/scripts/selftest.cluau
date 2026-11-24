@@ -1,0 +1,90 @@
+// The standard library's unit checks: `hamr exec tests/scripts/selftest.cluau`.
+// Exit code 1 and a line per failure when any check fails.
+
+const hamr = require("@hamr")
+const reportLib = require("@hamr/report")
+const findingsLib = require("@hamr/findings")
+const util = hamr.util
+const json = hamr.json
+type StepResult = hamr.StepResult
+
+let failures = 0
+
+local function expect(ok: boolean, what: string) {
+	if (!ok) {
+		failures += 1
+		print(`FAIL: {what}`)
+	}
+}
+
+local function result(name: string, startedAt: number, endedAt: number, status: string?): StepResult {
+	return {
+		name = name, tier = "fast", status = status || "pass", startedAt = startedAt, endedAt = endedAt,
+		seconds = endedAt - startedAt, cpuSeconds = 0, peakRssMB = 0, budget = 10,
+		findings = {}, runs = {}, tests = {}, children = {},
+	}
+}
+
+// JSON: a round trip, sorted keys, empty tables, escapes, numbers.
+expect(json.encode({ b = 1, a = { 1, 2, 3 }, c = "x\"y\n" }) == "{\"a\":[1,2,3],\"b\":1,\"c\":\"x\\\"y\\n\"}", "json encodes sorted keys and escapes")
+expect(json.encode({}) == "[]", "an empty table encodes as an array")
+expect(json.encode(json.object({})) == "{}", "json.object marks an empty object")
+expect(json.encode(0.1) == "0.1", "a fraction encodes in its shortest form")
+expect(json.encode(12) == "12", "an integer encodes without a fraction")
+type Sample = { list: { number }, name: string, nested: { ok: boolean } }
+const back: Sample? = json.decodeAs("{\"list\":[1,2.5],\"name\":\"\\u00e9\",\"nested\":{\"ok\":true}}")
+expect(back != nil and back.list[2] == 2.5 and back.name == "é" and back.nested.ok == true, "json decodes arrays, escapes and objects")
+const _, err = json.decode("{\"a\":")
+expect(err != nil, "json reports a truncated document")
+
+// Globs: * stays in a segment, ** crosses them.
+expect(host.globMatch("src/*.cpp", "src/main.cpp"), "* matches in a segment")
+expect(!host.globMatch("src/*.cpp", "src/a/main.cpp"), "* stops at /")
+expect(host.globMatch("src/**", "src/a/b/c.cpp"), "** crosses segments")
+expect(host.globMatch("src/**/c.cpp", "src/c.cpp"), "**/ matches no segment")
+expect(host.globMatch("net*", "net-test"), "a step name glob")
+
+// util
+expect(util.seconds(5.04) == "5.0s" and util.seconds(65) == "1m05s" and util.seconds(3725) == "1h02m", "durations format")
+expect(util.median({ 3, 1, 2 }) == 2 and util.median({ 4, 1, 2, 3 }) == 2.5 and util.median({}) == nil, "medians")
+expect(#util.lines("a\nb\n") == 2 and #util.lines("a\n\nb") == 3, "lines keeps empty lines but not a final newline")
+expect(util.commandLine({ "sh", "-c", "echo hi" }) == "sh -c 'echo hi'", "commands are quoted for display")
+
+// JUnit
+const junitPath = host.join(host.cwd(), "build", "selftest-junit.xml")
+host.write(junitPath, [[<testsuite><testcase classname="c" name="one" time="0.5"/><testcase name="two" time="1.25"><failure message="a &amp; b"/></testcase></testsuite>]])
+const cases: { findingsLib.JUnitCase } = findingsLib.readJUnit(junitPath) || {}
+expect(#cases == 2 and cases[1].name == "c.one" and cases[2].seconds == 1.25 and cases[2].status == "fail" and cases[2].message == "a & b", "JUnit cases, times and failures")
+host.remove(junitPath)
+
+// The critical path: b waited for a, c ran beside them.
+const path = reportLib.criticalPath({ result("a", 0, 5), result("b", 5.1, 9), result("c", 0, 2) })
+expect(#path == 2 and path[1] == "a" and path[2] == "b", `the critical path is a -> b, not {table.concat(path, " -> ")}`)
+const tied = reportLib.criticalPath({ result("x", 0, 0.01), result("y", 0, 0.01) })
+expect(#tied == 1, "steps ending together do not make a cycle")
+
+// Medians and budget warnings.
+const history: { reportLib.HistoryLine } = {}
+for (_, s in { 10, 11, 12 }) {
+	table.insert(history, { started = "", tier = "fast", wall = s, args = {}, steps = { slow = { s = s, st = "pass" } } })
+}
+const medians = reportLib.medians(history)
+expect(medians.seconds.slow == 11 and medians.samples.slow == 3, "the median of passing runs")
+const warnings = reportLib.budgetWarnings({ result("slow", 0, 30) }, medians, 30, 20)
+let kinds: { string } = {}
+for (_, w in warnings) {
+	table.insert(kinds, w.kind)
+}
+table.sort(kinds)
+expect(table.concat(kinds, ",") == "budget,regression,tier_budget", `over budget, a regression and the tier: got {table.concat(kinds, ",")}`)
+
+if (failures > 0) {
+	print(`selftest: {failures} failure(s)`)
+	return function(args: { string }): number {
+		return 1
+	}
+}
+print("selftest: all checks pass")
+return function(args: { string }): number {
+	return 0
+}

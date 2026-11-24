@@ -1,0 +1,169 @@
+// The hamr/1 report schema as data, and a validator: `hamr validate`, and
+// what a suite checks a report it did not write against.
+
+const M = {}
+
+export type Shape = {
+	kind: string, // string | number | boolean | object | array | map | any
+	fields: { [string]: Shape }?,
+	optional: { [string]: boolean }?,
+	item: Shape?,
+	values: { string }?,
+}
+
+local function str(values: { string }?): Shape {
+	return { kind = "string", values = values }
+}
+local function num(): Shape {
+	return { kind = "number" }
+}
+local function bool(): Shape {
+	return { kind = "boolean" }
+}
+local function array(item: Shape): Shape {
+	return { kind = "array", item = item }
+}
+local function map(item: Shape): Shape {
+	return { kind = "map", item = item }
+}
+local function object(fields: { [string]: Shape }, optional: { string }?): Shape {
+	const opt: { [string]: boolean } = {}
+	const names: { string } = optional || {}
+	for (_, name in names) {
+		opt[name] = true
+	}
+	return { kind = "object", fields = fields, optional = opt }
+}
+
+const kStatus = { "pass", "fail", "timeout", "blocked", "skipped", "interrupted", "waiting", "running" }
+
+const finding = object({ step = str(), kind = str(), message = str(), severity = str({ "error", "warning" }) })
+const run = object({
+	argv = array(str()), code = num(), signal = num(), timedOut = bool(), seconds = num(),
+	cpuSeconds = num(), peakRssMB = num(), leftProcesses = bool(), log = str(),
+}, { "code", "signal" })
+const test = object({ name = str(), seconds = num(), status = str() })
+
+// A step refers to itself through `children`; the validator follows the
+// name "step" for it.
+const step = object({
+	name = str(), tier = str({ "fast", "nightly", "manual" }), status = str(kStatus), reason = str(),
+	startedAt = num(), endedAt = num(), seconds = num(), cpuSeconds = num(), peakRssMB = num(),
+	budget = num(), timeout = num(), command = array(str()), log = str(),
+	findings = array(finding), runs = array(run), tests = array(test),
+	children = { kind = "step" }, meta = map(str()),
+}, { "reason", "budget", "timeout", "command", "log", "meta" })
+
+M.report = object({
+	schema = str({ "hamr/1" }),
+	suite = str(),
+	tier = str({ "fast", "nightly", "manual" }),
+	started = str(),
+	startedUnix = num(),
+	wallSeconds = num(),
+	machine = object({ hostname = str(), platform = str(), cores = num(), memoryMB = num() }),
+	revision = str(),
+	args = array(str()),
+	jobs = num(),
+	interrupted = bool(),
+	preflight = array(object({ severity = str({ "error", "warning" }), message = str() })),
+	steps = array(step),
+	findings = array(finding),
+	summary = object({
+		steps = num(), passed = num(), failed = num(), timedOut = num(), blocked = num(), skipped = num(),
+		interrupted = num(), errors = num(), warnings = num(), cpuSeconds = num(),
+		overBudget = array(str()), criticalPath = array(str()), tierBudget = num(),
+	}, { "tierBudget" }),
+}, { "revision" })
+
+local function field(t: unknown, key: string): unknown {
+	return (t :: any)[key] // allow-any: indexing a decoded document whose shape is being checked
+}
+
+local function length(t: unknown): number {
+	return #(t :: any) // allow-any: the length of a decoded array whose shape is being checked
+}
+
+local function at(t: unknown, i: number): unknown {
+	return (t :: any)[i] // allow-any: an element of a decoded array whose shape is being checked
+}
+
+local function entries(t: unknown): { [string]: unknown } {
+	return t :: any // allow-any: iterating a decoded object whose shape is being checked
+}
+
+local function check(value: unknown, shape: Shape, path: string, problems: { string }) {
+	if (#problems >= 50) {
+		return
+	}
+	let kind = shape.kind
+	if (kind == "step") {
+		shape = array(step)
+		kind = "array"
+	}
+	const actual = type(value)
+	if (kind == "string" || kind == "number" || kind == "boolean") {
+		if (actual != kind) {
+			table.insert(problems, `{path}: expected a {kind}, found {actual}`)
+			return
+		}
+		const values = shape.values
+		if (values != nil && type(value) == "string") {
+			for (_, allowed in values) {
+				if (value == allowed) {
+					return
+				}
+			}
+			table.insert(problems, `{path}: "{tostring(value)}" is not one of {table.concat(values, ", ")}`)
+		}
+		return
+	}
+	if (actual != "table") {
+		table.insert(problems, `{path}: expected a{if (kind == "array") "n array" else "n object"}, found {actual}`)
+		return
+	}
+	if (kind == "array") {
+		const item = shape.item
+		for (i = 1, length(value)) {
+			if (item != nil) {
+				check(at(value, i), item, `{path}[{i}]`, problems)
+			}
+		}
+		return
+	}
+	if (kind == "map") {
+		const item = shape.item
+		for (key, v in entries(value)) {
+			if (item != nil) {
+				check(v, item, `{path}.{key}`, problems)
+			}
+		}
+		return
+	}
+	const fields: { [string]: Shape } = shape.fields || {}
+	const optional: { [string]: boolean } = shape.optional || {}
+	const names: { string } = {}
+	for (name, _ in fields) {
+		table.insert(names, name)
+	}
+	table.sort(names)
+	for (_, name in names) {
+		const v = field(value, name)
+		if (v == nil) {
+			if (!optional[name]) {
+				table.insert(problems, `{path}.{name}: missing`)
+			}
+		} else {
+			check(v, fields[name], `{path}.{name}`, problems)
+		}
+	}
+}
+
+// Every way `value` differs from the hamr/1 report shape (empty: valid).
+function M.validate(value: unknown): { string } {
+	const problems: { string } = {}
+	check(value, M.report, "report", problems)
+	return problems
+}
+
+return M

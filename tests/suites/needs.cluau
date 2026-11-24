@@ -1,0 +1,9 @@
+// A failed need blocks what needs it; an independent step still runs.
+const hamr = require("@hamr")
+const suite = hamr.suite("needs")
+
+suite:step("fails", { run = { "sh", "-c", "echo broken; exit 3" }, timeout = 10, budget = 1 })
+suite:step("after", { run = { "true" }, needs = { "fails" }, timeout = 10, budget = 1 })
+suite:step("independent", { run = { "true" }, timeout = 10, budget = 1 })
+
+return suite

@@ -1,0 +1,9 @@
+// What the host measures: CPU time, peak memory, processes left behind.
+const hamr = require("@hamr")
+const suite = hamr.suite("measure")
+
+suite:step("cpu", { run = { "sh", "-c", "i=0; while [ $i -lt 400000 ]; do i=$((i+1)); done" }, timeout = 60, budget = 10 })
+suite:step("memory", { run = { "python3", "-c", "x = bytearray(200 * 1024 * 1024); x[::4096] = b'1' * len(x[::4096])" }, timeout = 60, budget = 10 })
+suite:step("stray", { run = { "sh", "-c", "sleep 33.3 > /dev/null 2>&1 &" }, timeout = 10, budget = 1 })
+
+return suite

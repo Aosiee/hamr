@@ -1,0 +1,8 @@
+// Interrupted mid-run (hamr's own suite sends SIGINT after a second).
+const hamr = require("@hamr")
+const suite = hamr.suite("slow")
+
+suite:step("long", { run = { "sleep", "32.9" }, timeout = 60, budget = 60 })
+suite:step("after", { run = { "true" }, needs = { "long" }, timeout = 60, budget = 1 })
+
+return suite

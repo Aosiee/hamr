@@ -1,0 +1,22 @@
+// A function step starts sub-steps; each is scheduled and timed on its own,
+// and a sub-step may need a sibling.
+const hamr = require("@hamr")
+const suite = hamr.suite("substeps")
+
+suite:step("phases", {
+	timeout = 30,
+	budget = 5,
+	run = function(ctx: hamr.Context) {
+		for (_, name in { "a", "b", "c" }) {
+			ctx:step(name, { run = { "sleep", "0.5" } })
+		}
+		ctx:step("d", { run = { "true" }, needs = { "a" } })
+		ctx:wait()
+		const probe = ctx:run({ "sh", "-c", "exit 4" }, { allowFail = true })
+		if (probe.code != 4) {
+			ctx:fail(`expected exit code 4, got {probe.code}`)
+		}
+	},
+})
+
+return suite

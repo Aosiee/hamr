@@ -1,0 +1,11 @@
+// Four one-second steps on four cores run side by side; the exclusive step
+// runs alone, after them (it is declared last and shorter).
+const hamr = require("@hamr")
+const suite = hamr.suite("parallel")
+
+for (i = 1, 4) {
+	suite:step(`sleep{i}`, { run = { "sleep", "1" }, timeout = 10, budget = 2 })
+}
+suite:step("alone", { run = { "sleep", "0.5" }, resources = { exclusive = true }, timeout = 10, budget = 2 })
+
+return suite

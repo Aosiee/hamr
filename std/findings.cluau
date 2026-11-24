@@ -1,0 +1,199 @@
+// Findings rules: how what a step did becomes findings. A rule runs after
+// the step's work, inside the step. Whatever a rule decides, a command that
+// exited non-zero still fails its step.
+
+const types = require("@hamr/types")
+const util = require("@hamr/util")
+type StepResult = types.StepResult
+type Context = types.Context
+type Rule = types.Rule
+type TestTime = types.TestTime
+
+const M = {}
+
+local function lastExit(result: StepResult): number? {
+	const run = result.runs[#result.runs]
+	if (run == nil) {
+		return nil
+	}
+	return run.code
+}
+
+// The default: a non-zero exit is the finding.
+function M.exitCode(): Rule {
+	return function(result: StepResult, ctx: Context) {
+		const code = lastExit(result)
+		if (code != nil && code != 0) {
+			ctx:finding("exit_code", `exited with code {code}`)
+		}
+	}
+}
+
+// When the command fails, every line of its output containing `marker`
+// (plain text, default "FAIL") is a finding of `kind`.
+function M.failLines(kind: string, marker: string?): Rule {
+	const needle = marker || "FAIL"
+	return function(result: StepResult, ctx: Context) {
+		const code = lastExit(result)
+		if (code == nil || code == 0) {
+			return
+		}
+		for (_, line in util.lines(ctx:readLog())) {
+			// "$ <command>" lines are hamr's own record of what ran.
+			if (!util.startsWith(line, "$ ") && string.find(line, needle, 1, true)) {
+				ctx:finding(kind, util.trim(line))
+			}
+		}
+	}
+}
+
+export type LogGateSpec = {
+	// The file to scan after the step (relative to the suite's directory);
+	// absent: the step's own output.
+	file: string?,
+	// Lua patterns; a matching line is a finding.
+	match: { string },
+	// Lua patterns of lines never to report.
+	ignore: { string }?,
+	kind: string?,
+	severity: string?,
+}
+
+// Scans a log file the step's program wrote, pass or fail.
+function M.logGate(spec: LogGateSpec): Rule {
+	return function(result: StepResult, ctx: Context) {
+		const file = spec.file
+		let text: string? = nil
+		if (file == nil) {
+			text = ctx:readLog()
+		} else {
+			text = host.read(if (util.startsWith(file, "/")) file else host.join(ctx.root, file))
+		}
+		if (text == nil) {
+			return
+		}
+		for (_, line in util.lines(text)) {
+			if (util.startsWith(line, "$ ")) {
+				continue
+			}
+			let hit = false
+			for (_, pattern in spec.match) {
+				if (string.find(line, pattern)) {
+					hit = true
+					break
+				}
+			}
+			if (hit) {
+				const ignore: { string } = spec.ignore || {}
+				for (_, pattern in ignore) {
+					if (string.find(line, pattern)) {
+						hit = false
+						break
+					}
+				}
+			}
+			if (hit) {
+				ctx:finding(spec.kind || "log_gate", line, spec.severity)
+			}
+		}
+	}
+}
+
+local function unescape(text: string): string {
+	let out = string.gsub(text, "&quot;", "\"")
+	out = string.gsub(out, "&apos;", "'")
+	out = string.gsub(out, "&lt;", "<")
+	out = string.gsub(out, "&gt;", ">")
+	out = string.gsub(out, "&amp;", "&")
+	return out
+}
+
+local function attribute(attrs: string, name: string): string? {
+	const value = string.match(attrs, "%s" .. name .. "=\"([^\"]*)\"")
+	if (value == nil) {
+		return nil
+	}
+	return unescape(value)
+}
+
+export type JUnitCase = {
+	name: string,
+	seconds: number,
+	status: string,
+	message: string?,
+}
+
+// The test cases of a JUnit XML file (ctest --output-junit, doctest's
+// junit reporter), with their times.
+function M.readJUnit(path: string): { JUnitCase }? {
+	const text = host.read(path)
+	if (text == nil) {
+		return nil
+	}
+	const tests: { JUnitCase } = {}
+	let at = 1
+	while (true) {
+		const s, e, attrs, closed = string.find(text, "<testcase([^>]-)(/?)>", at)
+		if (s == nil || e == nil || attrs == nil) {
+			break
+		}
+		let body = ""
+		at = e + 1
+		if (closed != "/") {
+			const bodyEnd = string.find(text, "</testcase>", at, true)
+			if (bodyEnd != nil) {
+				body = string.sub(text, at, bodyEnd - 1)
+				at = bodyEnd + 11
+			}
+		}
+		const name = attribute(attrs, "name") || "?"
+		const className = attribute(attrs, "classname")
+		let status = "pass"
+		if (string.find(body, "<failure", 1, true) || string.find(body, "<error", 1, true)) {
+			status = "fail"
+		} else if (string.find(body, "<skipped", 1, true)) {
+			status = "skipped"
+		}
+		let message: string? = nil
+		if (status == "fail") {
+			message = string.match(body, "message=\"([^\"]*)\"")
+		}
+		table.insert(tests, {
+			name = if (className != nil && className != "" && className != name) `{className}.{name}` else name,
+			seconds = tonumber(attribute(attrs, "time") || "0") || 0,
+			status = status,
+			message = if (message != nil) unescape(message) else nil,
+		})
+	}
+	return tests
+}
+
+// Reads the JUnit file the step wrote: every case's time goes into the
+// report, every failed case is a finding.
+function M.junit(file: string, kind: string?): Rule {
+	return function(result: StepResult, ctx: Context) {
+		const path = if (util.startsWith(file, "/")) file else host.join(ctx.root, file)
+		const tests = M.readJUnit(path)
+		if (tests == nil) {
+			ctx:finding(kind || "test", `no JUnit report at {path}`)
+			return
+		}
+		for (_, test in tests) {
+			table.insert(result.tests, { name = test.name, seconds = test.seconds, status = test.status })
+			if (test.status == "fail") {
+				ctx:finding(kind || "test", test.name .. (if (test.message != nil) ": " .. test.message else ""))
+			}
+		}
+	}
+}
+
+// Runs every rule.
+function M.all(rules: { Rule }): Rule {
+	return function(result: StepResult, ctx: Context) {
+		for (_, rule in rules) {
+			rule(result, ctx)
+		}
+	}
+}
+
+return M

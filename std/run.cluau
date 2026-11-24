@@ -1,0 +1,596 @@
+// The runner: every step is a coroutine; a step waits by yielding, and the
+// loop resumes it when its process ends (host.poll) or its sub-steps
+// finish. Steps are admitted longest-first (by their history median, else
+// their budget) while their resources fit; an exclusive step that cannot
+// start yet holds back everything behind it, so it is never starved.
+
+const types = require("@hamr/types")
+const util = require("@hamr/util")
+const findings = require("@hamr/findings")
+type Suite = types.Suite
+type StepDef = types.StepDef
+type StepResult = types.StepResult
+type Context = types.Context
+type Rule = types.Rule
+type Body = types.Body
+type Run = types.Run
+type RunOptions = types.RunOptions
+type SubStepSpec = types.SubStepSpec
+type Resources = types.Resources
+type Finding = types.Finding
+
+const M = {}
+
+type Node = {
+	name: string,
+	tier: string,
+	command: { string }?,
+	body: Body?,
+	needs: { string },
+	exclusive: boolean,
+	cpu: number,
+	tags: { string },
+	timeout: number,
+	cwd: string,
+	env: { [string]: string },
+	rule: Rule?,
+	parent: Node?,
+	order: number,
+	priority: number,
+	state: string,
+	pending: number,
+	waitingChildren: boolean,
+	co: thread?,
+	started: number,
+	result: StepResult,
+	logPath: string,
+	procResult: HostProcResult?,
+}
+
+export type Plan = {
+	suite: Suite,
+	selected: { StepDef },
+	skipped: { [string]: string },
+	jobs: number,
+	runDir: string,
+	medians: { [string]: number },
+	quiet: boolean,
+}
+
+export type Outcome = {
+	steps: { StepResult },
+	wall: number,
+	interrupted: boolean,
+}
+
+const kColors: { [string]: string } = { pass = "\27[32m", fail = "\27[31m", timeout = "\27[31m", blocked = "\27[33m", interrupted = "\27[33m" }
+
+local function newResult(name: string, tier: string, budget: number?, timeout: number?): StepResult {
+	return {
+		name = name,
+		tier = tier,
+		status = "waiting",
+		startedAt = 0,
+		endedAt = 0,
+		seconds = 0,
+		cpuSeconds = 0,
+		peakRssMB = 0,
+		budget = budget,
+		timeout = timeout,
+		findings = {},
+		runs = {},
+		tests = {},
+		children = {},
+	}
+}
+
+local function merged(a: { [string]: string }?, b: { [string]: string }?, c: { [string]: string }?): { [string]: string } {
+	const out: { [string]: string } = {}
+	for (_, source in { a, b, c }) {
+		if (source != nil) {
+			for (k, v in source) {
+				out[k] = v
+			}
+		}
+	}
+	return out
+}
+
+local function substitute(command: { string }, vars: { [string]: string }): { string } {
+	const out: { string } = {}
+	for (_, arg in command) {
+		const replaced = string.gsub(arg, "{([%w_]+)}", function(name: string): string {
+			return vars[name] || "{" .. name .. "}"
+		})
+		table.insert(out, replaced)
+	}
+	return out
+}
+
+function M.execute(plan: Plan): Outcome {
+	const suite = plan.suite
+	const t0 = host.monotonic()
+	const nodes: { Node } = {}
+	const byName: { [string]: Node } = {}
+	const owners: { [number]: Node } = {}
+	const running: { Node } = {}
+	const wake: { Node } = {}
+	const tty = host.isTty(1) && !plan.quiet
+	let done = 0
+	let lastTick = host.monotonic()
+	let statusShown = false
+	host.mkdir(host.join(plan.runDir, "logs"))
+
+	local function clearStatus() {
+		if (statusShown) {
+			host.stdout("\r\27[2K")
+			statusShown = false
+		}
+	}
+
+	local function showStatus() {
+		if (plan.quiet) {
+			return
+		}
+		const now = host.monotonic()
+		const parts: { string } = {}
+		for (_, n in running) {
+			if (n.pending == 0) {
+				table.insert(parts, `{n.name} {util.seconds(now - n.started)}`)
+			}
+		}
+		if (tty) {
+			let line = `  running: {table.concat(parts, ", ")}`
+			const width = host.terminalWidth()
+			if (#line > width - 1) {
+				line = string.sub(line, 1, width - 2) .. "…"
+			}
+			host.stdout("\r\27[2K\27[2m" .. line .. "\27[0m")
+			statusShown = true
+		} else if (now - lastTick >= 60 && #parts > 0) {
+			print(`  … still running: {table.concat(parts, ", ")}`)
+			lastTick = now
+		}
+	}
+
+	local function printFinish(r: StepResult) {
+		if (plan.quiet) {
+			return
+		}
+		clearStatus()
+		let note = ""
+		if (r.budget != nil) {
+			note = `  (budget {util.seconds(r.budget)})`
+			if (r.seconds > r.budget) {
+				note ..= if (tty) "  \27[33mover budget\27[0m" else "  over budget"
+			}
+		}
+		if (r.reason != nil) {
+			note ..= `  {r.reason}`
+		}
+		let status = util.padRight(r.status, 11)
+		const color = kColors[r.status]
+		if (tty && color != nil) {
+			status = color .. status .. "\27[0m"
+		}
+		print(string.format("[%3d/%d] %s %7s  %s%s", done, #nodes, status, util.seconds(r.seconds), r.name, note))
+	}
+
+	local function isAncestor(a: Node, b: Node): boolean {
+		let p = b.parent
+		while (p != nil) {
+			if (p == a) {
+				return true
+			}
+			p = p.parent
+		}
+		return false
+	}
+
+	local function fits(node: Node): boolean {
+		let cpu = 0
+		for (_, r in running) {
+			if (!isAncestor(r, node)) {
+				if (node.exclusive || r.exclusive) {
+					return false
+				}
+				cpu += r.cpu
+				for (_, tag in node.tags) {
+					if (util.contains(r.tags, tag)) {
+						return false
+					}
+				}
+			}
+		}
+		return cpu == 0 || cpu + node.cpu <= plan.jobs
+	}
+
+	// "ready", "wait", or the reason it can never run.
+	local function readiness(node: Node): string {
+		for (_, need in node.needs) {
+			const n = byName[need]
+			if (n != nil) {
+				if (n.state != "done") {
+					return "wait"
+				}
+				if (n.result.status != "pass" && n.result.status != "skipped") {
+					return `needs {need} ({n.result.status})`
+				}
+			}
+		}
+		return "ready"
+	}
+
+	local function finish(node: Node) {
+		const r = node.result
+		const now = host.monotonic()
+		r.endedAt = now - t0
+		r.seconds = now - node.started
+		if (r.status == "waiting" || r.status == "running") {
+			let status = "pass"
+			for (_, f in r.findings) {
+				if (f.severity == "error") {
+					status = "fail"
+				}
+			}
+			for (_, run in r.runs) {
+				if (run.timedOut) {
+					status = "timeout"
+				}
+			}
+			for (_, child in r.children) {
+				if (child.status != "pass" && child.status != "skipped" && status == "pass") {
+					status = "fail"
+				}
+			}
+			r.status = status
+		}
+		node.state = "done"
+		const index = table.find(running, node)
+		if (index != nil) {
+			table.remove(running, index)
+		}
+		done += 1
+		printFinish(r)
+		const parent = node.parent
+		if (parent != nil) {
+			parent.pending -= 1
+			if (parent.pending == 0) {
+				table.insert(wake, parent)
+			}
+		}
+	}
+
+	local function addFinding(node: Node, kind: string, message: string, severity: string?) {
+		const f: Finding = { step = node.name, kind = kind, message = message, severity = severity || "error" }
+		table.insert(node.result.findings, f)
+	}
+
+	// Defined below; a context's step() creates nodes.
+	let makeNode: (name: string, spec: SubStepSpec, tier: string, parent: Node?, order: number, budget: number?, timeout: number?) -> Node
+
+	local function makeContext(node: Node): Context {
+		const ctx: Context = {
+			name = node.name,
+			root = suite.root,
+			out = plan.runDir,
+			vars = suite.vars,
+			result = node.result,
+			run = function(self: Context, command: { string }, options: RunOptions?): Run {
+				const opts: RunOptions = options || {}
+				const log = opts.log || node.logPath
+				host.append(log, "$ " .. util.commandLine(command) .. "\n")
+				let timeout = node.timeout - (host.monotonic() - node.started)
+				if (opts.timeout != nil) {
+					timeout = math.min(timeout, opts.timeout)
+				}
+				timeout = math.max(timeout, 0.001)
+				const id = host.spawn({
+					argv = command,
+					cwd = opts.cwd || node.cwd,
+					env = merged(suite.options.env, node.env, opts.env),
+					log = log,
+					append = true,
+					timeout = timeout,
+				})
+				owners[id] = node
+				coroutine.yield()
+				const p = node.procResult
+				node.procResult = nil
+				assert(p != nil, "a step's coroutine was resumed before its process ended")
+				const run: Run = {
+					argv = command,
+					code = p.code,
+					signal = p.signal,
+					timedOut = p.timedOut,
+					seconds = p.seconds,
+					cpuSeconds = p.cpuSeconds,
+					peakRssMB = p.peakRssMB,
+					leftProcesses = p.leftProcesses,
+					log = log,
+				}
+				table.insert(node.result.runs, run)
+				node.result.cpuSeconds += p.cpuSeconds
+				node.result.peakRssMB = math.max(node.result.peakRssMB, p.peakRssMB)
+				const line = util.commandLine(command)
+				if (p.timedOut) {
+					addFinding(node, "timeout", `{line}: timed out after {util.seconds(p.seconds)}`)
+				} else if (!opts.allowFail) {
+					if (p.signal != nil) {
+						addFinding(node, "exit_code", `{line}: killed by signal {p.signal}`)
+					} else if (p.code != 0) {
+						addFinding(node, "exit_code", `{line}: exited with code {p.code}`)
+					}
+				}
+				if (p.leftProcesses) {
+					addFinding(node, "stray", `{line} left processes running in its group; hamr ended them`, "warning")
+				}
+				return run
+			},
+			step = function(self: Context, name: string, spec: SubStepSpec) {
+				const child = makeNode(name, spec, node.tier, node, #nodes + 1, spec.budget, spec.timeout)
+				table.insert(node.result.children, child.result)
+			},
+			wait = function(self: Context) {
+				while (node.pending > 0) {
+					node.waitingChildren = true
+					coroutine.yield()
+				}
+				node.waitingChildren = false
+			},
+			finding = function(self: Context, kind: string, message: string, severity: string?) {
+				addFinding(node, kind, message, severity)
+			},
+			fail = function(self: Context, message: string) {
+				addFinding(node, "fail", message)
+			},
+			log = function(self: Context, text: string) {
+				host.append(node.logPath, text .. "\n")
+			},
+			readLog = function(self: Context): string {
+				return host.read(node.logPath) || ""
+			},
+		}
+		return ctx
+	}
+
+	local function start(node: Node) {
+		node.state = "running"
+		node.started = host.monotonic()
+		node.result.status = "running"
+		node.result.startedAt = node.started - t0
+		host.write(node.logPath, "")
+		const ctx = makeContext(node)
+		node.co = coroutine.create(function() {
+			const command = node.command
+			if (command != nil) {
+				const argv = substitute(command, suite.vars)
+				node.result.command = argv
+				ctx:run(argv, { allowFail = true })
+			} else if (node.body != nil) {
+				node.body(ctx)
+			}
+			ctx:wait()
+			const rule = node.rule || (if (command != nil) findings.exitCode() else nil)
+			if (rule != nil) {
+				rule(node.result, ctx)
+			}
+			// Whatever the rule decided, a failed command fails its step.
+			const last = node.result.runs[#node.result.runs]
+			if (command != nil && last != nil && (last.code != 0 || last.signal != nil) && !last.timedOut) {
+				let failed = false
+				for (_, f in node.result.findings) {
+					if (f.severity == "error") {
+						failed = true
+					}
+				}
+				if (!failed) {
+					addFinding(node, "exit_code", if (last.signal != nil) `killed by signal {last.signal}` else `exited with code {last.code}`)
+				}
+			}
+		})
+		table.insert(running, node)
+		table.insert(wake, node)
+	}
+
+	local function resume(node: Node) {
+		const co = node.co
+		if (co == nil || coroutine.status(co) == "dead") {
+			if (node.state == "running" && node.pending == 0) {
+				finish(node)
+			}
+			return
+		}
+		// cluau code that never yields is held to the step's timeout too.
+		host.setDeadline(node.started + node.timeout)
+		const ok, err = coroutine.resume(co)
+		host.setDeadline(0)
+		if (!ok) {
+			addFinding(node, "error", debug.traceback(co, tostring(err)))
+		}
+		if (coroutine.status(co) == "dead" && node.pending == 0) {
+			finish(node)
+		}
+	}
+
+	makeNode = function(name: string, spec: SubStepSpec, tier: string, parent: Node?, order: number, budget: number?, timeout: number?): Node {
+		const full = if (parent != nil) `{parent.name}/{name}` else name
+		if (byName[full] != nil) {
+			error(`step "{full}" is started twice`, 3)
+		}
+		const needs: { string } = {}
+		const specNeeds: { string } = spec.needs || {}
+		for (_, need in specNeeds) {
+			if (parent != nil && byName[`{parent.name}/{need}`] != nil) {
+				table.insert(needs, `{parent.name}/{need}`)
+			} else {
+				table.insert(needs, need)
+			}
+		}
+		const res: Resources = spec.resources || {}
+		let remaining = 86400.0
+		if (parent != nil) {
+			remaining = math.max(parent.timeout - (host.monotonic() - parent.started), 0.001)
+		}
+		const run = spec.run
+		const node: Node = {
+			name = full,
+			tier = tier,
+			command = if (type(run) == "table") run else nil,
+			body = if (type(run) == "function") run else nil,
+			needs = needs,
+			exclusive = res.exclusive == true,
+			cpu = res.cpu || 1,
+			tags = res.tags || {},
+			timeout = math.min(timeout || remaining, remaining),
+			cwd = spec.cwd || suite.root,
+			env = spec.env || {},
+			rule = spec.findings,
+			parent = parent,
+			order = order,
+			priority = plan.medians[full] || budget || 0,
+			state = "waiting",
+			pending = 0,
+			waitingChildren = false,
+			started = 0,
+			result = newResult(full, tier, budget, timeout),
+			logPath = host.join(plan.runDir, "logs", util.fileName(full) .. ".log"),
+		}
+		node.result.log = node.logPath
+		node.result.meta = spec.meta
+		if (parent != nil) {
+			parent.pending += 1
+		}
+		table.insert(nodes, node)
+		byName[full] = node
+		return node
+	}
+
+	const outcome: Outcome = { steps = {}, wall = 0, interrupted = false }
+	for (_, def in suite.steps) {
+		const reason = plan.skipped[def.name]
+		if (reason != nil) {
+			const r = newResult(def.name, def.spec.tier || "fast", def.spec.budget, def.spec.timeout)
+			r.status = "skipped"
+			r.reason = reason
+			table.insert(outcome.steps, r)
+		} else {
+			const spec = def.spec
+			const node = makeNode(def.name, {
+				run = spec.run,
+				needs = spec.needs,
+				resources = spec.resources,
+				cwd = spec.cwd,
+				env = spec.env,
+				findings = spec.findings,
+				meta = spec.meta,
+			}, spec.tier || "fast", nil, def.index, spec.budget, spec.timeout)
+			table.insert(outcome.steps, node.result)
+		}
+	}
+
+	local function admit(): boolean {
+		const candidates: { Node } = {}
+		for (_, n in nodes) {
+			if (n.state == "waiting") {
+				const why = readiness(n)
+				if (why == "ready") {
+					table.insert(candidates, n)
+				} else if (why != "wait") {
+					n.result.status = "blocked"
+					n.result.reason = why
+					n.started = host.monotonic()
+					finish(n)
+				}
+			}
+		}
+		table.sort(candidates, function(a: Node, b: Node): boolean {
+			if (a.priority != b.priority) {
+				return a.priority > b.priority
+			}
+			return a.order < b.order
+		})
+		let started = false
+		for (_, n in candidates) {
+			if (fits(n)) {
+				start(n)
+				started = true
+			} else if (n.exclusive) {
+				break
+			}
+		}
+		return started
+	}
+
+	while (true) {
+		while (#wake > 0) {
+			resume(table.remove(wake, 1) :: Node)
+		}
+		const started = admit()
+		if (#wake > 0) {
+			continue
+		}
+		if (#running == 0) {
+			let waiting = false
+			for (_, n in nodes) {
+				if (n.state == "waiting") {
+					waiting = true
+				}
+			}
+			if (!waiting) {
+				break
+			}
+			if (!started) {
+				// Nothing runs and nothing fits: run the first waiting step
+				// anyway rather than stall (a step wider than -j).
+				for (_, n in nodes) {
+					if (n.state == "waiting" && readiness(n) == "ready") {
+						start(n)
+						break
+					}
+				}
+				if (#wake == 0) {
+					break
+				}
+			}
+			continue
+		}
+		const results, interrupted = host.poll(if (tty) 0.5 else 1)
+		for (_, p in results) {
+			const owner = owners[p.id]
+			if (owner != nil) {
+				owners[p.id] = nil
+				owner.procResult = p
+				table.insert(wake, owner)
+			}
+		}
+		if (interrupted) {
+			outcome.interrupted = true
+			clearStatus()
+			print("hamr: interrupted; ending the running steps")
+			for (id, _ in owners) {
+				host.kill(id)
+			}
+			while (host.running() > 0) {
+				host.poll(1)
+			}
+			for (_, n in nodes) {
+				if (n.state == "running") {
+					n.result.status = "interrupted"
+					finish(n)
+				} else if (n.state == "waiting") {
+					n.result.status = "skipped"
+					n.result.reason = "interrupted"
+					n.state = "done"
+				}
+			}
+			break
+		}
+		showStatus()
+	}
+	clearStatus()
+	outcome.wall = host.monotonic() - t0
+	return outcome
+}
+
+return M

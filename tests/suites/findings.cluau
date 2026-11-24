@@ -1,0 +1,35 @@
+// The findings rules: FAIL lines, a JUnit report, a log gate on a passing
+// step.
+const hamr = require("@hamr")
+const suite = hamr.suite("findings")
+
+suite:step("fail-lines", {
+	run = { "sh", "-c", "echo 'check A ok'; echo 'FAIL: check B'; exit 1" },
+	findings = hamr.findings.failLines("checks"),
+	timeout = 10, budget = 1,
+})
+
+const junit = [[<?xml version="1.0"?>
+<testsuites><testsuite name="s">
+<testcase classname="math" name="adds" time="0.25"/>
+<testcase classname="math" name="divides" time="1.5"><failure message="divided by zero"/></testcase>
+<testcase classname="math" name="skips" time="0"><skipped/></testcase>
+</testsuite></testsuites>]]
+
+suite:step("junit", {
+	run = function(ctx: hamr.Context) {
+		host.write(host.join(ctx.out, "junit.xml"), junit)
+	},
+	findings = function(result: hamr.StepResult, ctx: hamr.Context) {
+		hamr.findings.junit(host.join(ctx.out, "junit.xml"))(result, ctx)
+	},
+	timeout = 10, budget = 1,
+})
+
+suite:step("gate", {
+	run = { "sh", "-c", "echo 'all good'; echo 'VUID-vkCmdDraw-01234 broke'; echo 'benign submesh slot 5 VUID'" },
+	findings = hamr.findings.logGate({ match = { "VUID" }, ignore = { "submesh slot 5" } }),
+	timeout = 10, budget = 1,
+})
+
+return suite

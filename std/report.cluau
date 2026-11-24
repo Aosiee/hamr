@@ -1,0 +1,392 @@
+// The report (schema hamr/1), the run history, the budget warnings and the
+// end-of-run table.
+
+const types = require("@hamr/types")
+const util = require("@hamr/util")
+const json = require("@hamr/json")
+type StepResult = types.StepResult
+type Finding = types.Finding
+
+const M = {}
+
+export type PreflightItem = types.PreflightItem
+export type Summary = types.Summary
+export type Report = types.Report
+
+export type HistoryStep = { s: number, st: string }
+export type HistoryLine = {
+	started: string,
+	tier: string,
+	wall: number,
+	args: { string },
+	steps: { [string]: HistoryStep },
+}
+
+const kHistoryRuns = 20
+const kKeepRuns = 20
+const kHistoryKeep = 500
+
+function M.flatten(steps: { StepResult }): { StepResult } {
+	const out: { StepResult } = {}
+	local function walk(list: { StepResult }) {
+		for (_, r in list) {
+			table.insert(out, r)
+			walk(r.children)
+		}
+	}
+	walk(steps)
+	return out
+}
+
+local function ran(r: StepResult): boolean {
+	return r.status != "skipped" && r.status != "blocked" && r.status != "waiting"
+}
+
+function M.readHistory(out: string): { HistoryLine } {
+	const text = host.read(host.join(out, "history.jsonl"))
+	if (text == nil) {
+		return {}
+	}
+	const all: { HistoryLine } = {}
+	for (_, line in util.lines(text)) {
+		const entry: HistoryLine? = json.decodeAs(line)
+		if (entry != nil && type(entry.steps) == "table") {
+			table.insert(all, entry)
+		}
+	}
+	const recent: { HistoryLine } = {}
+	for (i = math.max(1, #all - kHistoryRuns + 1), #all) {
+		table.insert(recent, all[i])
+	}
+	return recent
+}
+
+export type Medians = { seconds: { [string]: number }, samples: { [string]: number } }
+
+// Each step's median time over the passing runs in the history.
+function M.medians(history: { HistoryLine }): Medians {
+	const values: { [string]: { number } } = {}
+	for (_, line in history) {
+		for (name, step in line.steps) {
+			if (step.st == "pass") {
+				const list = values[name] || {}
+				table.insert(list, step.s)
+				values[name] = list
+			}
+		}
+	}
+	const out: Medians = { seconds = {}, samples = {} }
+	for (name, list in values) {
+		out.seconds[name] = util.median(list) || 0
+		out.samples[name] = #list
+	}
+	return out
+}
+
+// Timing warnings: over budget, a regression against the median, and the
+// tier over its total. Warnings only: timing on a busy machine is noisy.
+function M.budgetWarnings(steps: { StepResult }, medians: Medians, wall: number, tierBudget: number?): { Finding } {
+	const out: { Finding } = {}
+	for (_, r in M.flatten(steps)) {
+		if (ran(r)) {
+			const budget = r.budget
+			if (budget != nil && r.seconds > budget) {
+				table.insert(out, { step = r.name, kind = "budget", severity = "warning",
+					message = `took {util.seconds(r.seconds)}, budget {util.seconds(budget)}` })
+			}
+			const median = medians.seconds[r.name]
+			const samples = medians.samples[r.name] || 0
+			const doubled = budget != nil && r.seconds > 2 * budget
+			const slower = median != nil && samples >= 3 && r.seconds > median * 1.5 && r.seconds - median > 10
+			if (doubled || slower) {
+				const against = if (median != nil) `median {util.seconds(median)} over {samples} runs` else `budget {util.seconds(budget || 0)}`
+				table.insert(out, { step = r.name, kind = "regression", severity = "warning",
+					message = `took {util.seconds(r.seconds)} ({against})` })
+			}
+		}
+	}
+	if (tierBudget != nil && wall > tierBudget) {
+		const top = table.clone(steps)
+		table.sort(top, function(a: StepResult, b: StepResult): boolean {
+			return a.seconds > b.seconds
+		})
+		const names: { string } = {}
+		for (i = 1, math.min(3, #top)) {
+			table.insert(names, `{top[i].name} {util.seconds(top[i].seconds)}`)
+		}
+		table.insert(out, { step = "", kind = "tier_budget", severity = "warning",
+			message = `the run took {util.seconds(wall)}, over the tier's {util.seconds(tierBudget)}; the longest: {table.concat(names, ", ")}` })
+	}
+	return out
+}
+
+// The chain of top-level steps that set the wall time: from the step that
+// ended last, back through what ended just before each started (a need, or
+// the step whose resources it waited for).
+function M.criticalPath(steps: { StepResult }): { string } {
+	let last: StepResult? = nil
+	for (_, r in steps) {
+		if (ran(r) && (last == nil || r.endedAt > last.endedAt)) {
+			last = r
+		}
+	}
+	const chain: { string } = {}
+	const seen: { [string]: boolean } = {}
+	let current = last
+	while (current != nil && !seen[current.name]) {
+		seen[current.name] = true
+		table.insert(chain, 1, current.name)
+		const start = current.startedAt
+		let previous: StepResult? = nil
+		for (_, r in steps) {
+			// Started earlier and ended about when this one started.
+			if (ran(r) && !seen[r.name] && r.startedAt < start && r.endedAt <= start + 0.25 && r.endedAt >= start - 1.0) {
+				if (previous == nil || r.endedAt > previous.endedAt) {
+					previous = r
+				}
+			}
+		}
+		current = previous
+	}
+	return chain
+}
+
+export type BuildArgs = {
+	suite: string,
+	tier: string,
+	startedUnix: number,
+	wall: number,
+	args: { string },
+	jobs: number,
+	interrupted: boolean,
+	preflight: { PreflightItem },
+	steps: { StepResult },
+	revision: string?,
+	medians: Medians,
+	tierBudget: number?,
+}
+
+function M.build(a: BuildArgs): Report {
+	// The tier's warning belongs to no step: it is in the findings list only.
+	const unowned: { Finding } = {}
+	for (_, f in M.budgetWarnings(a.steps, a.medians, a.wall, a.tierBudget)) {
+		if (f.step == "") {
+			table.insert(unowned, f)
+		}
+		for (_, r in M.flatten(a.steps)) {
+			if (r.name == f.step) {
+				table.insert(r.findings, f)
+			}
+		}
+	}
+	const summary: Summary = {
+		steps = 0, passed = 0, failed = 0, timedOut = 0, blocked = 0, skipped = 0, interrupted = 0,
+		errors = 0, warnings = 0, cpuSeconds = 0, overBudget = {}, criticalPath = M.criticalPath(a.steps),
+		tierBudget = a.tierBudget,
+	}
+	const all: { Finding } = {}
+	for (_, r in M.flatten(a.steps)) {
+		summary.steps += 1
+		if (r.status == "pass") {
+			summary.passed += 1
+		} else if (r.status == "fail") {
+			summary.failed += 1
+		} else if (r.status == "timeout") {
+			summary.timedOut += 1
+		} else if (r.status == "blocked") {
+			summary.blocked += 1
+		} else if (r.status == "skipped") {
+			summary.skipped += 1
+		} else if (r.status == "interrupted") {
+			summary.interrupted += 1
+		}
+		summary.cpuSeconds += r.cpuSeconds
+		if (r.budget != nil && ran(r) && r.seconds > (r.budget :: number)) {
+			table.insert(summary.overBudget, r.name)
+		}
+		for (_, f in r.findings) {
+			table.insert(all, f)
+			if (f.severity == "error") {
+				summary.errors += 1
+			} else {
+				summary.warnings += 1
+			}
+		}
+	}
+	for (_, f in unowned) {
+		table.insert(all, f)
+		summary.warnings += 1
+	}
+	const mem = host.memory()
+	return {
+		schema = "hamr/1",
+		suite = a.suite,
+		tier = a.tier,
+		started = host.isoTime(a.startedUnix),
+		startedUnix = a.startedUnix,
+		wallSeconds = a.wall,
+		machine = { hostname = host.hostname(), platform = host.platform(), cores = host.cores(), memoryMB = math.floor(mem.totalMB) },
+		revision = a.revision,
+		args = a.args,
+		jobs = a.jobs,
+		interrupted = a.interrupted,
+		preflight = a.preflight,
+		steps = a.steps,
+		findings = all,
+		summary = summary,
+	}
+}
+
+// Writes the run's report, the latest copy and the history line, and
+// keeps the newest runs only.
+function M.write(report: Report, out: string, runDir: string) {
+	const text = json.encode(report, 2)
+	host.write(host.join(runDir, "report.json"), text .. "\n")
+	host.write(host.join(out, "latest.json"), text .. "\n")
+	if (!report.interrupted) {
+		const steps: { [string]: HistoryStep } = {}
+		for (_, r in M.flatten(report.steps)) {
+			if (ran(r)) {
+				steps[r.name] = { s = math.floor(r.seconds * 100 + 0.5) / 100, st = r.status }
+			}
+		}
+		const line: HistoryLine = { started = report.started, tier = report.tier, wall = report.wallSeconds, args = report.args, steps = json.object(steps) }
+		const historyPath = host.join(out, "history.jsonl")
+		host.append(historyPath, json.encode(line) .. "\n")
+		// The history keeps the newest lines only.
+		const all = util.lines(host.read(historyPath) || "")
+		if (#all > kHistoryKeep) {
+			const kept: { string } = {}
+			for (i = #all - kHistoryKeep + 1, #all) {
+				table.insert(kept, all[i])
+			}
+			host.write(historyPath, table.concat(kept, "\n") .. "\n")
+		}
+	}
+	const runs = host.join(out, "runs")
+	const names = host.list(runs)
+	for (i = 1, #names - kKeepRuns) {
+		host.remove(host.join(runs, names[i]))
+	}
+}
+
+local function vsMedian(r: StepResult, medians: Medians): string {
+	const median = medians.seconds[r.name]
+	if (median == nil || median <= 0) {
+		return "new"
+	}
+	const change = (r.seconds - median) / median * 100
+	return string.format("%+.0f%%", change)
+}
+
+local function megabytes(mb: number): string {
+	if (mb >= 1024) {
+		return string.format("%.1fG", mb / 1024)
+	}
+	return string.format("%.0fM", mb)
+}
+
+function M.printTable(report: Report, medians: Medians, tty: boolean) {
+	const dim = if (tty) "\27[2m" else ""
+	const reset = if (tty) "\27[0m" else ""
+	const critical: { [string]: boolean } = {}
+	for (_, name in report.summary.criticalPath) {
+		critical[name] = true
+	}
+	const wall = math.max(report.wallSeconds, 0.001)
+	print("")
+	print(dim .. "  status      time  share     cpu    rss  budget  vs med  step" .. reset)
+	local function row(r: StepResult, depth: number) {
+		const share = if (depth == 0) string.format("%4.0f%%", r.seconds / wall * 100) else "     "
+		const budget = if (r.budget != nil) util.seconds(r.budget :: number) else "-"
+		const mark = if (critical[r.name] && depth == 0) "*" else " "
+		const name = string.rep("  ", depth) .. (if (depth > 0) string.match(r.name, "[^/]+$") || r.name else r.name)
+		print(string.format("  %-9s %7s  %s  %6s  %5s  %6s  %6s %s%s",
+			r.status, util.seconds(r.seconds), share, util.seconds(r.cpuSeconds), megabytes(r.peakRssMB),
+			budget, vsMedian(r, medians), mark, name))
+		const children = table.clone(r.children)
+		table.sort(children, function(a: StepResult, b: StepResult): boolean {
+			return a.seconds > b.seconds
+		})
+		for (_, child in children) {
+			if (ran(child)) {
+				row(child, depth + 1)
+			}
+		}
+	}
+	const top = table.clone(report.steps)
+	table.sort(top, function(a: StepResult, b: StepResult): boolean {
+		return a.seconds > b.seconds
+	})
+	for (_, r in top) {
+		if (ran(r)) {
+			row(r, 0)
+		}
+	}
+	const notRun: { string } = {}
+	for (_, r in report.steps) {
+		if (!ran(r)) {
+			table.insert(notRun, `{r.name} ({r.status}{if (r.reason != nil) ": " .. (r.reason :: string) else ""})`)
+		}
+	}
+	if (#notRun > 0) {
+		print(dim .. "  not run: " .. table.concat(notRun, ", ") .. reset)
+	}
+	if (#report.summary.criticalPath > 1) {
+		print(dim .. "  * critical path: " .. table.concat(report.summary.criticalPath, " -> ") .. reset)
+	}
+
+	// The slowest test cases of the steps that reported them.
+	const tests: { { name: string, seconds: number } } = {}
+	for (_, r in M.flatten(report.steps)) {
+		for (_, t in r.tests) {
+			table.insert(tests, { name = `{r.name}: {t.name}`, seconds = t.seconds })
+		}
+	}
+	if (#tests > 0) {
+		table.sort(tests, function(a: { name: string, seconds: number }, b: { name: string, seconds: number }): boolean {
+			return a.seconds > b.seconds
+		})
+		print("")
+		print(dim .. "  slowest tests" .. reset)
+		for (i = 1, math.min(8, #tests)) {
+			print(string.format("  %7s  %s", util.seconds(tests[i].seconds), tests[i].name))
+		}
+	}
+}
+
+function M.printFindings(report: Report, tty: boolean) {
+	const red = if (tty) "\27[31m" else ""
+	const yellow = if (tty) "\27[33m" else ""
+	const reset = if (tty) "\27[0m" else ""
+	if (#report.findings == 0) {
+		return
+	}
+	print("")
+	for (_, severity in { "error", "warning" }) {
+		for (_, f in report.findings) {
+			if (f.severity == severity) {
+				let message = f.message
+				if (#message > 400) {
+					message = string.sub(message, 1, 400) .. "…"
+				}
+				const mark = if (severity == "error") red .. "  error  " .. reset else yellow .. "  warning" .. reset
+				const where = if (f.step != "") f.step .. ": " else ""
+				print(`{mark} {where}{f.kind}: {message}`)
+			}
+		}
+	}
+	// The end of each failed step's log.
+	for (_, r in M.flatten(report.steps)) {
+		if ((r.status == "fail" || r.status == "timeout") && #r.children == 0 && r.log != nil) {
+			const text = host.read(r.log :: string) || ""
+			print("")
+			print(`  ── {r.name} ({r.log}) ──`)
+			for (_, line in util.tail(text, 15)) {
+				print("  " .. line)
+			}
+		}
+	}
+}
+
+return M

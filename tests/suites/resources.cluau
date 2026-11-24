@@ -1,0 +1,16 @@
+// Steps sharing a tag run one at a time; a variable reaches a command.
+const hamr = require("@hamr")
+const suite = hamr.suite("resources")
+suite:var("word", "default")
+
+suite:step("tagged1", { run = { "sleep", "0.5" }, resources = { tags = { "ports" } }, timeout = 10, budget = 1 })
+suite:step("tagged2", { run = { "sleep", "0.5" }, resources = { tags = { "ports" } }, timeout = 10, budget = 1 })
+suite:step("echo", { run = { "sh", "-c", "echo word={word}" }, timeout = 10, budget = 1 })
+suite:step("later", { tier = "nightly", run = { "true" }, timeout = 10, budget = 1 })
+
+// A report hook sees the report and the run's directory.
+suite:onReport(function(report: hamr.Report, runDir: string) {
+	host.write(host.join(runDir, "hook.txt"), `{report.suite} {report.summary.passed}`)
+})
+
+return suite

@@ -1,0 +1,296 @@
+// hamr's own suite: build hamr, type-check its library and every suite and
+// script here, run its unit checks, and run each sample suite with the new
+// binary, checking what the sample's report says.
+//
+//     hamr run                       (with any hamr; it builds and tests build/suite/hamr)
+//     hamr run --set luauDir=<dir> --set cluauDir=<dir>   (build against local checkouts)
+
+const hamr = require("@hamr")
+const reportLib = require("@hamr/report")
+const schema = require("@hamr/schema")
+type Report = reportLib.Report
+type StepResult = hamr.StepResult
+type Context = hamr.Context
+
+const suite = hamr.suite("hamr", { budgets = { fast = 120 } })
+const buildDir = suite:var("buildDir", "build/suite")
+const luauDir = suite:var("luauDir", "")
+const cluauDir = suite:var("cluauDir", "")
+const bin = buildDir .. "/hamr"
+
+suite:step("build", {
+	doc = "Configures and builds hamr in its own build directory.",
+	resources = { exclusive = true },
+	timeout = 1800,
+	budget = 60,
+	paths = { "src/**", "std/**", "types/**", "cmake/**", "CMakeLists.txt" },
+	run = function(ctx: Context) {
+		const configure = { "cmake", "-S", ".", "-B", buildDir, "-DCMAKE_BUILD_TYPE=Release" }
+		const ninja = host.capture({ "ninja", "--version" })
+		if (ninja == 0 && !host.exists(host.join(ctx.root, buildDir, "Makefile"))) {
+			table.insert(configure, "-GNinja")
+		}
+		if (luauDir != "") {
+			table.insert(configure, "-DHAMR_LUAU_DIR=" .. luauDir)
+		}
+		if (cluauDir != "") {
+			table.insert(configure, "-DHAMR_CLUAU_DIR=" .. cluauDir)
+		}
+		ctx:run(configure)
+		ctx:run({ "cmake", "--build", buildDir, "-j", tostring(host.cores()) })
+	},
+})
+
+suite:step("check-std", {
+	doc = "The standard library under cluau's strict rules.",
+	run = { bin, "check", "--std" },
+	needs = { "build" },
+	timeout = 120,
+	budget = 10,
+})
+
+suite:step("check-suites", {
+	doc = "This suite, the samples and the test scripts under cluau's strict rules.",
+	needs = { "build" },
+	timeout = 120,
+	budget = 10,
+	run = function(ctx: Context) {
+		const files = { "hamr.cluau" }
+		for (_, file in host.glob("tests/**/*.cluau", ctx.root)) {
+			table.insert(files, file)
+		}
+		const argv = { bin, "check" }
+		for (_, file in files) {
+			table.insert(argv, file)
+		}
+		ctx:run(argv)
+	},
+})
+
+suite:step("selftest", {
+	doc = "The library's unit checks (JSON, globs, JUnit, history, budgets, the critical path).",
+	run = { bin, "exec", "tests/scripts/selftest.cluau" },
+	needs = { "build" },
+	timeout = 60,
+	budget = 5,
+})
+
+local function stepOf(r: Report, name: string): StepResult? {
+	for (_, s in reportLib.flatten(r.steps)) {
+		if (s.name == name) {
+			return s
+		}
+	}
+	return nil
+}
+
+local function expectStatus(ctx: Context, r: Report, name: string, status: string) {
+	const s = stepOf(r, name)
+	if (s == nil) {
+		ctx:fail(`the report has no step {name}`)
+	} else if (s.status != status) {
+		ctx:fail(`{name} is {s.status}, expected {status}`)
+	}
+}
+
+local function processRunning(cmdline: string): boolean {
+	for (_, p in host.processes()) {
+		if (p.cmdline == cmdline) {
+			return true
+		}
+	}
+	return false
+}
+
+type Check = (ctx: Context, r: Report) -> ()
+
+// Runs a sample suite with the new hamr and checks its exit code and
+// report.
+local function sample(parent: Context, name: string, file: string, extra: { string }, expectCode: number, check: Check) {
+	parent:step(name, {
+		resources = { cpu = 4 },
+		run = function(ctx: Context) {
+			const out = host.join(ctx.out, "samples", name)
+			const argv = { bin, "run", `tests/suites/{file}.cluau`, "--out", out, "--quiet", "-j", "4" }
+			for (_, arg in extra) {
+				table.insert(argv, arg)
+			}
+			const run = ctx:run(argv, { allowFail = true })
+			if (run.code != expectCode) {
+				ctx:fail(`exited with code {run.code}, expected {expectCode}`)
+			}
+			const r: Report? = hamr.json.readAs(host.join(out, "latest.json"))
+			if (r == nil) {
+				ctx:fail(`no report at {out}/latest.json`)
+				return
+			}
+			const text = host.read(host.join(out, "latest.json")) || ""
+			const decoded = host.jsonDecode(text)
+			for (_, problem in schema.validate(decoded)) {
+				ctx:fail(`the report does not match hamr/1: {problem}`)
+			}
+			check(ctx, r)
+		},
+	})
+}
+
+suite:step("samples", {
+	doc = "Every sample suite, run by the new hamr, its report checked.",
+	needs = { "build" },
+	resources = { cpu = 0 },
+	timeout = 300,
+	budget = 15,
+	run = function(ctx: Context) {
+		sample(ctx, "parallel", "parallel", {}, 0, function(c: Context, r: Report) {
+			if (r.wallSeconds > 2.6) {
+				c:fail(`four 1 s steps on -j 4 then a 0.5 s one took {r.wallSeconds} s`)
+			}
+			const alone = stepOf(r, "alone")
+			if (alone != nil && alone.startedAt < 0.9) {
+				c:fail("the exclusive step started beside the others")
+			}
+		})
+		sample(ctx, "needs", "needs", {}, 1, function(c: Context, r: Report) {
+			expectStatus(c, r, "fails", "fail")
+			expectStatus(c, r, "after", "blocked")
+			expectStatus(c, r, "independent", "pass")
+		})
+		sample(ctx, "timeout", "timeout", {}, 1, function(c: Context, r: Report) {
+			expectStatus(c, r, "hangs", "timeout")
+			const s = stepOf(r, "hangs")
+			if (s != nil && s.seconds > 3) {
+				c:fail(`the timed-out step took {s.seconds} s to end`)
+			}
+			if (processRunning("sleep 31.7")) {
+				c:fail("the timed-out step's background process survived")
+			}
+		})
+		sample(ctx, "substeps", "substeps", {}, 0, function(c: Context, r: Report) {
+			expectStatus(c, r, "phases", "pass")
+			const phases = stepOf(r, "phases")
+			if (phases != nil && #phases.children != 4) {
+				c:fail(`phases has {#phases.children} sub-steps, expected 4`)
+			}
+			const a = stepOf(r, "phases/a")
+			const b = stepOf(r, "phases/b")
+			const d = stepOf(r, "phases/d")
+			if (a != nil && b != nil && math.abs(a.startedAt - b.startedAt) > 0.3) {
+				c:fail("sub-steps a and b did not run side by side")
+			}
+			if (a != nil && d != nil && d.startedAt < a.endedAt - 0.05) {
+				c:fail("sub-step d started before the sibling it needs ended")
+			}
+		})
+		sample(ctx, "findings", "findings", {}, 1, function(c: Context, r: Report) {
+			const failLines = stepOf(r, "fail-lines")
+			if (failLines != nil && (#failLines.findings != 1 || failLines.findings[1].message != "FAIL: check B")) {
+				c:fail(`fail-lines has {#failLines.findings} findings, expected only "FAIL: check B"`)
+			}
+			const junit = stepOf(r, "junit")
+			if (junit != nil && (#junit.tests != 3 || #junit.findings != 1)) {
+				c:fail(`junit read {#junit.tests} tests and {#junit.findings} findings, expected 3 and 1`)
+			}
+			const gate = stepOf(r, "gate")
+			if (gate != nil && (#gate.findings != 1 || !string.find(gate.findings[1].message, "VUID-vkCmdDraw", 1, true))) {
+				c:fail("the log gate did not report exactly the VUID line")
+			}
+		})
+		sample(ctx, "measure", "measure", {}, 0, function(c: Context, r: Report) {
+			const cpu = stepOf(r, "cpu")
+			if (cpu != nil && cpu.cpuSeconds < 0.1) {
+				c:fail(`a busy loop measured {cpu.cpuSeconds} s of CPU`)
+			}
+			const memory = stepOf(r, "memory")
+			if (memory != nil && memory.peakRssMB < 190) {
+				c:fail(`a 200 MB allocation measured a {memory.peakRssMB} MB peak`)
+			}
+			const stray = stepOf(r, "stray")
+			if (stray != nil && (#stray.findings != 1 || stray.findings[1].kind != "stray")) {
+				c:fail("the step that left a process running has no stray warning")
+			}
+			if (processRunning("sleep 33.3")) {
+				c:fail("the stray process survived")
+			}
+		})
+		sample(ctx, "resources", "resources", { "--set", "word=hello" }, 0, function(c: Context, r: Report) {
+			const one = stepOf(r, "tagged1")
+			const two = stepOf(r, "tagged2")
+			if (one != nil && two != nil && one.startedAt < two.endedAt - 0.05 && two.startedAt < one.endedAt - 0.05) {
+				c:fail("two steps holding the same tag overlapped")
+			}
+			const echo = stepOf(r, "echo")
+			const log = if (echo != nil && echo.log != nil) host.read(echo.log :: string) else nil
+			if (log == nil || !string.find(log, "word=hello", 1, true)) {
+				c:fail("--set word=hello did not reach the command")
+			}
+			expectStatus(c, r, "later", "skipped")
+			const runs = host.list(host.join(c.out, "samples", "resources", "runs"))
+			const hook = host.read(host.join(c.out, "samples", "resources", "runs", runs[#runs] or "", "hook.txt"))
+			if (hook != "resources 3") {
+				c:fail(`the report hook wrote {hook or "nothing"}, expected "resources 3"`)
+			}
+		})
+		sample(ctx, "spin", "spin", {}, 1, function(c: Context, r: Report) {
+			expectStatus(c, r, "spins", "fail")
+			expectStatus(c, r, "after", "pass")
+			const s = stepOf(r, "spins")
+			if (s != nil && s.seconds > 3) {
+				c:fail(`the spinning step ran {s.seconds} s past a 1 s timeout`)
+			}
+		})
+		sample(ctx, "nightly", "resources", { "--tier", "nightly" }, 0, function(c: Context, r: Report) {
+			expectStatus(c, r, "later", "pass")
+		})
+		sample(ctx, "only", "parallel", { "--only", "sleep1", "--skip", "alone" }, 0, function(c: Context, r: Report) {
+			expectStatus(c, r, "sleep1", "pass")
+			expectStatus(c, r, "sleep2", "skipped")
+			expectStatus(c, r, "alone", "skipped")
+		})
+		ctx:step("interrupt", {
+			resources = { cpu = 1 },
+			run = function(c: Context) {
+				const out = host.join(c.out, "samples", "interrupt")
+				const run = c:run({ "timeout", "--preserve-status", "-s", "INT", "1.5", bin, "run", "tests/suites/slow.cluau", "--out", out, "--quiet" }, { allowFail = true })
+				if (run.code != 130) {
+					c:fail(`an interrupted run exited with code {run.code}, expected 130`)
+				}
+				const r: Report? = hamr.json.readAs(host.join(out, "latest.json"))
+				if (r == nil) {
+					c:fail("an interrupted run wrote no report")
+					return
+				}
+				if (!r.interrupted) {
+					c:fail("the report does not say the run was interrupted")
+				}
+				expectStatus(c, r, "long", "interrupted")
+				expectStatus(c, r, "after", "skipped")
+				if (processRunning("sleep 32.9")) {
+					c:fail("the interrupted step's process survived")
+				}
+			},
+		})
+		ctx:step("history", {
+			resources = { cpu = 4 },
+			run = function(c: Context) {
+				const out = host.join(c.out, "samples", "history")
+				for (_ = 1, 2) {
+					c:run({ bin, "run", "tests/suites/parallel.cluau", "--out", out, "--quiet", "-j", "4" })
+				}
+				const text = host.read(host.join(out, "history.jsonl")) || ""
+				const lines = hamr.util.lines(text)
+				if (#lines != 2) {
+					c:fail(`history.jsonl has {#lines} lines after two runs`)
+				}
+				const listing = host.join(c.out, "samples", "history-list.txt")
+				c:run({ bin, "list", "tests/suites/parallel.cluau", "--out", out }, { log = listing })
+				const shown = host.read(listing) || ""
+				// sleep1's median and last time, about a second each.
+				if (!string.find(shown, "1%.0s%s+1%.0s%s+sleep1")) {
+					c:fail("hamr list does not show sleep1's median")
+				}
+			},
+		})
+	},
+})
+
+return suite

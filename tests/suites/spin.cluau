@@ -1,0 +1,17 @@
+// A step whose cluau code never yields is still held to its timeout.
+const hamr = require("@hamr")
+const suite = hamr.suite("spin")
+
+suite:step("spins", {
+	timeout = 1,
+	budget = 1,
+	run = function(ctx: hamr.Context) {
+		let n = 0
+		while (true) {
+			n += 1
+		}
+	},
+})
+suite:step("after", { run = { "true" }, timeout = 10, budget = 1 })
+
+return suite

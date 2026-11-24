@@ -1,0 +1,127 @@
+// Small helpers: formatting, lists, text.
+
+const M = {}
+
+function M.seconds(s: number): string {
+	if (s < 10) {
+		return string.format("%.1fs", s)
+	} else if (s < 60) {
+		return string.format("%.0fs", s)
+	} else if (s < 3600) {
+		return string.format("%dm%02ds", math.floor(s / 60), math.floor(s % 60))
+	}
+	return string.format("%dh%02dm", math.floor(s / 3600), math.floor((s % 3600) / 60))
+}
+
+function M.padRight(text: string, width: number): string {
+	if (#text >= width) {
+		return text
+	}
+	return text .. string.rep(" ", width - #text)
+}
+
+function M.padLeft(text: string, width: number): string {
+	if (#text >= width) {
+		return text
+	}
+	return string.rep(" ", width - #text) .. text
+}
+
+function M.median(values: { number }): number? {
+	if (#values == 0) {
+		return nil
+	}
+	const sorted = table.clone(values)
+	table.sort(sorted)
+	const mid = math.floor((#sorted + 1) / 2)
+	if (#sorted % 2 == 1) {
+		return sorted[mid]
+	}
+	return (sorted[mid] + sorted[mid + 1]) / 2
+}
+
+function M.lines(text: string): { string } {
+	const out: { string } = {}
+	for (line in string.gmatch(text, "([^\n]*)\n?")) {
+		table.insert(out, line)
+	}
+	if (#out > 0 && out[#out] == "") {
+		table.remove(out)
+	}
+	return out
+}
+
+function M.tail(text: string, count: number): { string } {
+	const all = M.lines(text)
+	const out: { string } = {}
+	for (i = math.max(1, #all - count + 1), #all) {
+		table.insert(out, all[i])
+	}
+	return out
+}
+
+function M.startsWith(text: string, prefix: string): boolean {
+	return string.sub(text, 1, #prefix) == prefix
+}
+
+function M.trim(text: string): string {
+	return (string.gsub(text, "^%s*(.-)%s*$", "%1"))
+}
+
+function M.contains(list: { string }, value: string): boolean {
+	for (_, item in list) {
+		if (item == value) {
+			return true
+		}
+	}
+	return false
+}
+
+function M.matchesAny(patterns: { string }, text: string): boolean {
+	for (_, pattern in patterns) {
+		if (host.globMatch(pattern, text)) {
+			return true
+		}
+	}
+	return false
+}
+
+// A command as a person would type it (for logs and reports).
+function M.commandLine(argv: { string }): string {
+	const parts: { string } = {}
+	for (_, arg in argv) {
+		if (arg == "" || string.find(arg, "[%s'\"$`\\]")) {
+			table.insert(parts, "'" .. string.gsub(arg, "'", "'\\''") .. "'")
+		} else {
+			table.insert(parts, arg)
+		}
+	}
+	return table.concat(parts, " ")
+}
+
+// A step name as a file name.
+function M.fileName(name: string): string {
+	return (string.gsub(name, "[^%w%-_.]", "_"))
+}
+
+const kBars = { "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" }
+
+function M.sparkline(values: { number }): string {
+	if (#values == 0) {
+		return ""
+	}
+	let low = math.huge
+	let high = -math.huge
+	for (_, v in values) {
+		low = math.min(low, v)
+		high = math.max(high, v)
+	}
+	const out: { string } = {}
+	for (_, v in values) {
+		const index = if (high > low) math.floor((v - low) / (high - low) * 7 + 0.5) + 1 else 4
+		table.insert(out, kBars[index])
+	}
+	return table.concat(out)
+}
+
+return M

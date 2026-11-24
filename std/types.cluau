@@ -1,0 +1,207 @@
+// The types every part of the standard library shares. A suite reaches
+// them through require("@hamr") (hamr.StepSpec, hamr.Context, ...).
+
+// What a step needs while it runs. `exclusive` runs it alone; `cpu` is its
+// share of the core budget (-j, default 1); a tag ("ports", "gpu") is held
+// by one step at a time. A step never waits for its own ancestors.
+export type Resources = {
+	exclusive: boolean?,
+	cpu: number?,
+	tags: { string }?,
+}
+
+// "error" fails the step and the run; "warning" is reported only.
+export type Finding = {
+	step: string,
+	kind: string,
+	message: string,
+	severity: string,
+}
+
+// One process a step ran.
+export type Run = {
+	argv: { string },
+	code: number?,
+	signal: number?,
+	timedOut: boolean,
+	seconds: number,
+	cpuSeconds: number,
+	peakRssMB: number,
+	leftProcesses: boolean,
+	log: string,
+}
+
+// A test case a step reported (from JUnit XML).
+export type TestTime = {
+	name: string,
+	seconds: number,
+	status: string,
+}
+
+// status: pass | fail | timeout | blocked | skipped | interrupted
+export type StepResult = {
+	name: string,
+	tier: string,
+	status: string,
+	reason: string?,
+	startedAt: number,
+	endedAt: number,
+	seconds: number,
+	cpuSeconds: number,
+	peakRssMB: number,
+	budget: number?,
+	timeout: number?,
+	command: { string }?,
+	log: string?,
+	findings: { Finding },
+	runs: { Run },
+	tests: { TestTime },
+	children: { StepResult },
+	// The suite's own labels for the step (spec.meta), copied as they are.
+	meta: { [string]: string }?,
+}
+
+export type RunOptions = {
+	cwd: string?,
+	env: { [string]: string }?,
+	timeout: number?,
+	// A non-zero exit is an error finding unless this is set.
+	allowFail: boolean?,
+	// The log to write to (default: the step's own).
+	log: string?,
+}
+
+export type Context = {
+	name: string,
+	// The suite's directory, where steps run unless they say otherwise.
+	root: string,
+	// This run's directory.
+	out: string,
+	vars: { [string]: string },
+	result: StepResult,
+	run: (self: Context, command: { string }, options: RunOptions?) -> Run,
+	step: (self: Context, name: string, spec: SubStepSpec) -> (),
+	wait: (self: Context) -> (),
+	finding: (self: Context, kind: string, message: string, severity: string?) -> (),
+	fail: (self: Context, message: string) -> (),
+	log: (self: Context, text: string) -> (),
+	readLog: (self: Context) -> string,
+}
+
+// Turns what a step did into findings; runs after the step's work.
+export type Rule = (result: StepResult, ctx: Context) -> ()
+
+export type Body = (ctx: Context) -> ()
+
+export type StepSpec = {
+	// fast (the default) | nightly | manual
+	tier: string?,
+	// A command (its arguments may name a suite variable as "{name}") or a
+	// function, which may run commands and start sub-steps.
+	run: { string } | Body,
+	needs: { string }?,
+	resources: Resources?,
+	// Seconds. Required: a step says what it may cost.
+	timeout: number,
+	budget: number,
+	cwd: string?,
+	env: { [string]: string }?,
+	findings: Rule?,
+	// The source globs the step covers (--changed).
+	paths: { string }?,
+	doc: string?,
+	// Labels of the suite's own, copied into the report (a report hook
+	// reads them).
+	meta: { [string]: string }?,
+}
+
+export type SubStepSpec = {
+	run: { string } | Body,
+	needs: { string }?,
+	resources: Resources?,
+	timeout: number?,
+	budget: number?,
+	cwd: string?,
+	env: { [string]: string }?,
+	findings: Rule?,
+	doc: string?,
+	meta: { [string]: string }?,
+}
+
+export type Preflight = {
+	warn: (self: Preflight, message: string) -> (),
+	fail: (self: Preflight, message: string) -> (),
+}
+
+export type PreflightItem = { severity: string, message: string }
+
+export type Summary = {
+	steps: number,
+	passed: number,
+	failed: number,
+	timedOut: number,
+	blocked: number,
+	skipped: number,
+	interrupted: number,
+	errors: number,
+	warnings: number,
+	cpuSeconds: number,
+	overBudget: { string },
+	criticalPath: { string },
+	tierBudget: number?,
+}
+
+export type Report = {
+	schema: string,
+	suite: string,
+	tier: string,
+	started: string,
+	startedUnix: number,
+	wallSeconds: number,
+	machine: { hostname: string, platform: string, cores: number, memoryMB: number },
+	revision: string?,
+	args: { string },
+	jobs: number,
+	interrupted: boolean,
+	preflight: { PreflightItem },
+	steps: { StepResult },
+	findings: { Finding },
+	summary: Summary,
+}
+
+// Runs after the report is written: a suite's own outputs from it.
+export type ReportHook = (report: Report, runDir: string) -> ()
+
+export type SuiteOptions = {
+	// The output directory, relative to the suite (default .hamr).
+	out: string?,
+	// A tier's total wall-time budget in seconds ({ fast = 600 }).
+	budgets: { [string]: number }?,
+	env: { [string]: string }?,
+}
+
+export type StepDef = {
+	name: string,
+	spec: StepSpec,
+	index: number,
+}
+
+export type Suite = {
+	name: string,
+	root: string,
+	file: string,
+	options: SuiteOptions,
+	steps: { StepDef },
+	byName: { [string]: StepDef },
+	preflights: { (p: Preflight) -> () },
+	strayNames: { string },
+	reportHooks: { ReportHook },
+	vars: { [string]: string },
+	step: (self: Suite, name: string, spec: StepSpec) -> (),
+	preflight: (self: Suite, check: (p: Preflight) -> ()) -> (),
+	strays: (self: Suite, names: { string }) -> (),
+	var: (self: Suite, name: string, default: string) -> string,
+	onReport: (self: Suite, hook: ReportHook) -> (),
+}
+
+return {}
