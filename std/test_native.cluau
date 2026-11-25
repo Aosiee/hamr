@@ -1,7 +1,8 @@
-// The adapter for binaries on hamr's C++ library (hamr/test.h): it lists
-// with `--list-json <file>`, runs a batch with `--run <ids> --events <file>`,
-// and reads the events file, one JSON object a line, written as each case
-// goes.
+// The adapter for binaries built on hamr's C++ library (hamr/test.h). It lists
+// the cases with `--list-json <file>`, runs a batch with
+// `--run <file> --events <file>`, and reads the events file: one JSON object
+// per line, written as the cases run, so a batch that dies still says how far
+// it got.
 
 const types = require("@hamr/types")
 const util = require("@hamr/util")

@@ -119,6 +119,9 @@ suite:step("test-library", {
 			["flaky: fails beside another case, passes alone"] = "flaky",
 			["subcases: each leaf once"] = "pass",
 			["slow: half a second"] = "pass",
+			["threads: checks from a case's worker threads"] = "pass",
+			["chars read as themselves"] = "fail",
+			["skipped"] = "skipped",
 		}
 		const seen: { [string]: string } = {}
 		for (_, s in reportLib.flatten(r.steps)) {
@@ -130,9 +133,6 @@ suite:step("test-library", {
 			if (seen[name] != status) {
 				ctx:fail(`"{name}" is {seen[name] or "missing"}, expected {status}`)
 			}
-		}
-		if (seen["skipped"] != nil) {
-			ctx:fail("the case marked skip ran")
 		}
 		const clean = ctx:run({ bin, "test", sample, "--out", host.join(out, "clean"), "--quiet" }, { allowFail = true })
 		if (clean.code != 0) {

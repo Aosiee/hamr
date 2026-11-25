@@ -191,12 +191,13 @@ without a suite.
 - **Isolation:** a case that crashes is `crashed` (the end of its output in
   the finding), and a case over its timeout (`timeout`, default 60 s, or the
   case's own) is ended with its process as `timeout`. Either way the rest of
-  its batch runs again in a new process.
+  its batch runs in a new process.
 - **Flaky cases:** a case that fails beside other cases runs once more
   alone. If it passes alone it is `flaky`: a warning, never a pass.
 - **Serial cases:** the cases matching `serial` run alone, after the rest.
-- **Selection:** `cases` and `exclude` (globs) choose the cases; a case
-  marked skip is listed but not run.
+- **Selection:** `cases` and `exclude` (globs) and `tags` (a case with one
+  of them) choose the cases; a case marked skip is reported `skipped` and not
+  run.
 - **Results:** every case run is in the step's `tests` (name, status, time,
   file, line). A failed, crashed or timed-out case is an error finding, a
   flaky one a warning. Each case's last ten passing times are kept in
@@ -209,7 +210,7 @@ without a suite.
 | `workers`, `workerCpu` | Worker processes, and the `cpu` share each takes. |
 | `timeout`, `batchSeconds` | Per case, and a batch's length. |
 | `budget`, `stepTimeout` | The whole step's. |
-| `serial`, `cases`, `exclude`, `rerun` | As above (`rerun = false`: no alone re-run). |
+| `serial`, `cases`, `tags`, `exclude`, `rerun` | As above (`rerun = false`: no alone re-run). |
 | `tier`, `needs`, `paths`, `meta`, `doc`, `resources` | As for any step. |
 
 ### Adapters
@@ -234,13 +235,17 @@ target `hamr::test`).
   `CHECK_NOTHROW` and the `REQUIRE_` ones. A comparison reports both values
   (with `operator<<` when the type has one).
 - `INFO(...)` and `CAPTURE(x)` add context to the failures after them in the
-  same scope; `MESSAGE(...)` records a line; `FAIL(...)` fails and ends the
-  case, `FAIL_CHECK(...)` fails and goes on.
+  same scope, on the same thread; `MESSAGE(...)` records a line; `FAIL(...)`
+  fails and ends the case, `FAIL_CHECK(...)` fails and goes on.
+- Checks may run on any of a case's threads. A REQUIRE belongs on the
+  case's own thread, since its failure ends the case: on another, use CHECK.
+- Case names must be unique; a binary with two cases of one name refuses to
+  run and names both.
 - `hamr::test::Approx(x)` (`.epsilon(e)`, `.scale(s)`).
 - `SUBCASE("name")`: the case runs once per leaf subcase.
-- A REQUIRE that fails ends its case by an exception; built without
-  exceptions, it reports the case and ends the process (exit code 3), and
-  hamr runs the rest of the batch in a new one.
+- A REQUIRE that fails ends its case by throwing; in a build without
+  exceptions it reports the case and ends the process (exit code 3), and hamr
+  runs the rest of the batch in a new one.
 - `#define HAMR_TEST_MAIN` before the include gives the default `main`; a
   custom one calls `hamr::test::Run(argc, argv)`.
 - The binary on its own: `--case <glob>`, `--exclude <glob>`, `--list`,

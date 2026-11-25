@@ -22,8 +22,14 @@
 // result behind it.
 //
 // A custom main calls hamr::test::Run(argc, argv) and returns its result.
+//
+// Checks may run on any thread (a case's worker threads may CHECK). INFO
+// and CAPTURE belong to the thread that wrote them. A failed REQUIRE ends
+// its case by an exception, so it belongs on the case's own thread; on
+// another thread, use CHECK.
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -34,6 +40,7 @@
 #include <functional>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <ostream>
 #include <set>
 #include <sstream>
@@ -65,7 +72,7 @@ struct skip {
 	explicit skip(bool value = true) : Value(value) {}
 };
 
-// Words a suite can select or exclude cases by (comma separated).
+// Words a suite can select cases by (comma separated).
 struct tags {
 	std::string Value;
 	explicit tags(std::string value) : Value(std::move(value)) {}
@@ -164,7 +171,14 @@ std::string ToString(const T& value) {
 		return value ? "true" : "false";
 	} else if constexpr (std::is_same_v<U, std::nullptr_t>) {
 		return "nullptr";
-	} else if constexpr (std::is_same_v<U, char> || std::is_same_v<U, signed char> || std::is_same_v<U, unsigned char>) {
+	} else if constexpr (std::is_same_v<U, char>) {
+		// A printable char reads as itself and its code, anything else as its code.
+		const int code = static_cast<unsigned char>(value);
+		if (code >= 0x20 && code < 0x7f)
+			return std::string("'") + value + "' (" + std::to_string(code) + ")";
+		return std::to_string(code);
+	} else if constexpr (std::is_same_v<U, signed char> || std::is_same_v<U, unsigned char>) {
+		// Byte-sized integers (int8_t, uint8_t): their value.
 		return std::to_string(static_cast<int>(value));
 	} else if constexpr (std::is_same_v<U, std::string> || std::is_same_v<U, std::string_view>) {
 		return detail::Quote(value);
@@ -250,10 +264,11 @@ struct Subcases {
 };
 
 struct State {
+	// Guards Failures, the events file and the console: checks may come
+	// from a case's worker threads.
+	std::mutex Lock;
 	std::vector<Failure> Failures;
-	int Assertions = 0;
-	std::vector<std::function<std::string()>> Context;
-	std::vector<std::string> Messages;
+	std::atomic<int> Assertions{0};
 	Subcases Sub;
 	const Case* Current = nullptr;
 	std::FILE* Events = nullptr;
@@ -263,6 +278,12 @@ struct State {
 inline State& St() {
 	static State state;
 	return state;
+}
+
+// INFO and CAPTURE context: the writing thread's own.
+inline std::vector<std::function<std::string()>>& Context() {
+	thread_local std::vector<std::function<std::string()>> context;
+	return context;
 }
 
 // The exception a failed REQUIRE ends its case with.
@@ -291,6 +312,7 @@ inline std::string JsonString(std::string_view s) {
 	return out;
 }
 
+// Writes one events line; the caller holds the lock (or is the only thread).
 inline void Emit(const std::string& line) {
 	if (St().Events) {
 		std::fputs(line.c_str(), St().Events);
@@ -324,8 +346,9 @@ private:
 
 inline void Record(Failure failure) {
 	State& s = St();
-	for (auto& context : s.Context)
+	for (auto& context : Context())
 		failure.Context.push_back(context());
+	std::lock_guard<std::mutex> lock(s.Lock);
 	failure.Subcase = SubcasePath();
 	if (s.Console) {
 		std::fprintf(stderr, "%s:%d: %s in \"%s\"%s%s\n", failure.File.c_str(), failure.Line,
@@ -432,15 +455,16 @@ inline void Throws(const char* macro, bool require, bool threw, bool expected, c
 		AbortCase();
 }
 
-inline void Note(const char* file, int line, const std::string& text, const char* kind) {
+inline void Message(const char* file, int line, const std::string& text) {
 	State& s = St();
-	if (std::string(kind) == "message") {
-		if (s.Console)
-			std::fprintf(stderr, "%s:%d: MESSAGE: %s\n", file, line, text.c_str());
-		Emit("{\"event\":\"message\",\"file\":" + JsonString(file) + ",\"line\":" + std::to_string(line) +
-			",\"text\":" + JsonString(text) + "}");
-		return;
-	}
+	std::lock_guard<std::mutex> lock(s.Lock);
+	if (s.Console)
+		std::fprintf(stderr, "%s:%d: MESSAGE: %s\n", file, line, text.c_str());
+	Emit("{\"event\":\"message\",\"file\":" + JsonString(file) + ",\"line\":" + std::to_string(line) +
+		",\"text\":" + JsonString(text) + "}");
+}
+
+inline void Fail(const char* file, int line, const std::string& text) {
 	Failure f;
 	f.Kind = "fail";
 	f.File = file;
@@ -451,8 +475,8 @@ inline void Note(const char* file, int line, const std::string& text, const char
 
 class ScopedInfo {
 public:
-	explicit ScopedInfo(std::function<std::string()> text) { St().Context.push_back(std::move(text)); }
-	~ScopedInfo() { St().Context.pop_back(); }
+	explicit ScopedInfo(std::function<std::string()> text) { Context().push_back(std::move(text)); }
+	~ScopedInfo() { Context().pop_back(); }
 	ScopedInfo(const ScopedInfo&) = delete;
 	ScopedInfo& operator=(const ScopedInfo&) = delete;
 };
@@ -531,16 +555,22 @@ struct CaseResult {
 	size_t Failures = 0;
 };
 
+// A guard against subcases that never settle (a name built from a counter).
+inline constexpr int kMaxCaseRuns = 100000;
+
 inline CaseResult RunCase(const Case& c) {
 	State& s = St();
-	s.Current = &c;
-	s.Failures.clear();
+	{
+		std::lock_guard<std::mutex> lock(s.Lock);
+		s.Current = &c;
+		s.Failures.clear();
+		Emit("{\"event\":\"case-start\",\"name\":" + JsonString(c.Name) + "}");
+	}
 	s.Assertions = 0;
-	s.Context.clear();
+	Context().clear();
 	s.Sub = Subcases{};
-	Emit("{\"event\":\"case-start\",\"name\":" + JsonString(c.Name) + "}");
 	const auto start = std::chrono::steady_clock::now();
-	for (int run = 0; run < 100000; run++) {
+	for (int run = 0; run < kMaxCaseRuns; run++) {
 		s.Sub.Stack.clear();
 		s.Sub.EnteredAt.clear();
 		s.Sub.Incomplete = false;
@@ -571,6 +601,7 @@ inline CaseResult RunCase(const Case& c) {
 		if (!pending && !s.Sub.Incomplete)
 			break;
 	}
+	std::lock_guard<std::mutex> lock(s.Lock);
 	CaseResult r;
 	r.Seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 	r.Assertions = s.Assertions;
@@ -587,7 +618,7 @@ inline CaseResult RunCase(const Case& c) {
 // The cases, in registration order (the order of their files' inclusion).
 inline const std::vector<Case>& Cases() { return detail::Registry(); }
 
-inline const char* kUsage =
+inline constexpr const char kUsage[] =
 	"usage: <test binary> [options]\n"
 	"  --case <glob>       run only the cases whose name matches (repeatable)\n"
 	"  --exclude <glob>    run none of the cases whose name matches (repeatable)\n"
@@ -642,6 +673,19 @@ inline int Run(int argc, char** argv) {
 		} else {
 			std::fprintf(stderr, "unknown argument '%s'\n%s", arg.c_str(), kUsage);
 			return 2;
+		}
+	}
+
+	// Case names must be unique: hamr runs and reports cases by name.
+	{
+		std::map<std::string, const Case*> seen;
+		for (const Case& c : Cases()) {
+			auto [it, fresh] = seen.emplace(c.Name, &c);
+			if (!fresh) {
+				std::fprintf(stderr, "two cases are named '%s' (%s:%d and %s:%d); a case's name must be unique\n", c.Name.c_str(),
+					it->second->File, it->second->Line, c.File, c.Line);
+				return 2;
+			}
 		}
 	}
 
@@ -848,14 +892,14 @@ inline int Run(int argc, char** argv) {
 #define CAPTURE(x) INFO(#x " := " << ::hamr::test::ToString(x))
 
 // A message recorded with the case, not a failure.
-#define MESSAGE(msg) ::hamr::test::detail::Note(__FILE__, __LINE__, HAMR_TEST_MESSAGE(msg), "message")
+#define MESSAGE(msg) ::hamr::test::detail::Message(__FILE__, __LINE__, HAMR_TEST_MESSAGE(msg))
 // A failure that ends the case, and one that does not.
 #define FAIL(msg)                                                                                                      \
 	do {                                                                                                               \
-		::hamr::test::detail::Note(__FILE__, __LINE__, HAMR_TEST_MESSAGE(msg), "fail");                                 \
+		::hamr::test::detail::Fail(__FILE__, __LINE__, HAMR_TEST_MESSAGE(msg));                                         \
 		::hamr::test::detail::AbortCase();                                                                             \
 	} while (false)
-#define FAIL_CHECK(msg) ::hamr::test::detail::Note(__FILE__, __LINE__, HAMR_TEST_MESSAGE(msg), "fail")
+#define FAIL_CHECK(msg) ::hamr::test::detail::Fail(__FILE__, __LINE__, HAMR_TEST_MESSAGE(msg))
 
 #ifdef HAMR_TEST_MAIN
 int main(int argc, char** argv) { return ::hamr::test::Run(argc, argv); }

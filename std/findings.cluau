@@ -123,8 +123,8 @@ export type JUnitCase = {
 	message: string?,
 }
 
-// The test cases of a JUnit XML file (ctest --output-junit, a test
-// junit reporter), with their times.
+// The test cases of a JUnit XML file (what `ctest --output-junit` and most
+// test frameworks' JUnit reporters write), with their times.
 function M.readJUnit(path: string): { JUnitCase }? {
 	const text = host.read(path)
 	if (text == nil) {

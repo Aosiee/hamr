@@ -1,7 +1,7 @@
-// The sample C++ suite hamr's own suite runs through the native adapter:
-// cases that pass, fail in each way, crash, hang and use subcases. The
-// misbehaving ones act only when HAMR_SAMPLE names them, so the binary run
-// plainly passes.
+// The sample cases hamr's own suite runs through the native adapter: cases
+// that pass, fail in each way, crash, hang, turn out flaky, check from many
+// threads, use subcases or are skipped. The misbehaving ones act only when
+// HAMR_SAMPLE names them, so the binary run on its own passes.
 
 #define HAMR_TEST_MAIN
 #include "hamr/test.h"
@@ -114,6 +114,23 @@ TEST_CASE("subcases: each leaf once") {
 		SUBCASE("a2") { MESSAGE("a2"); }
 	}
 	SUBCASE("b") { MESSAGE("b"); }
+}
+
+TEST_CASE("threads: checks from a case's worker threads") {
+	std::vector<std::thread> threads;
+	for (int t = 0; t < 8; t++)
+		threads.emplace_back([t] {
+			INFO("thread " << t);
+			for (int i = 0; i < 1000; i++)
+				CHECK(i + t >= t);
+		});
+	for (std::thread& thread : threads)
+		thread.join();
+}
+
+TEST_CASE("chars read as themselves") {
+	if (Enabled("fail"))
+		CHECK('a' == 'b');
 }
 
 TEST_CASE("skipped" * hamr::test::skip()) {

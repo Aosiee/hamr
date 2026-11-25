@@ -42,7 +42,7 @@ export type CaseFailure = {
 
 export type CaseOutcome = {
 	name: string,
-	// pass | fail | crashed | timeout | flaky
+	// pass | fail | crashed | timeout | flaky | skipped
 	status: string,
 	seconds: number,
 	failures: { CaseFailure },
@@ -104,8 +104,10 @@ export type TestsSpec = {
 	batchSeconds: number?,
 	// Cases (globs) that run alone, after the rest.
 	serial: { string }?,
-	// Only these cases (globs), and none of these.
+	// Only these cases (globs), only the cases with one of these tags, and
+	// none of these (globs).
 	cases: { string }?,
+	tags: { string }?,
 	exclude: { string }?,
 	// Run a failed case again alone (default true).
 	rerun: boolean?,
@@ -117,19 +119,36 @@ function M.register(adapter: Adapter) {
 	M.adapters[adapter.name] = adapter
 }
 
+// A registered adapter, or the standard library's `@hamr/test_<name>`. An
+// adapter module that fails to load raises its own error.
 local function adapterNamed(name: string): Adapter? {
 	const known = M.adapters[name]
 	if (known != nil) {
 		return known
 	}
-	const ok, loaded = pcall(function(): Adapter {
-		return host.require(`@hamr/test_{name}`) :: any // allow-any: an adapter module's value is the adapter
-	})
-	if (ok && loaded != nil) {
-		M.register(loaded)
-		return loaded
+	if (host.resolve("", `@hamr/test_{name}`) == nil) {
+		return nil
 	}
-	return nil
+	const loaded: Adapter = host.require(`@hamr/test_{name}`) :: any // allow-any: an adapter module's value is the adapter
+	M.register(loaded)
+	return loaded
+}
+
+// The most cases one batch holds, however short they are.
+const kMaxBatchCases = 200
+
+// Whether one of the words of `list` (comma separated) is in `wanted`.
+local function hasTag(list: string?, wanted: { string }): boolean {
+	for (tag in string.gmatch(list or "", "[^,]+")) {
+		if (util.contains(wanted, util.trim(tag))) {
+			return true
+		}
+	}
+	return false
+}
+
+local function plural(n: number, one: string, many: string?): string {
+	return `{n} {if (n == 1) one else many or one .. "s"}`
 }
 
 type CaseTimes = { [string]: { number } }
@@ -142,8 +161,17 @@ local function tail(path: string, count: number): string {
 	return table.concat(util.tail(host.read(path) or "", count), "\n")
 }
 
-local function failureText(f: CaseFailure): string {
-	let text = `{f.file}:{f.line}:`
+// A path as the suite's people know it: relative to the suite when it is
+// inside it.
+local function shown(root: string, file: string): string {
+	if (util.startsWith(file, root .. "/")) {
+		return string.sub(file, #root + 2)
+	}
+	return file
+}
+
+local function failureText(root: string, f: CaseFailure): string {
+	let text = `{shown(root, f.file)}:{f.line}:`
 	if (f.expression != "") {
 		text ..= ` {f.expression}`
 	}
@@ -156,8 +184,15 @@ local function failureText(f: CaseFailure): string {
 	if (f.subcase != "") {
 		text ..= ` (in {f.subcase})`
 	}
-	if (#f.context > 0) {
-		text ..= ` [{table.concat(f.context, "; ")}]`
+	// An INFO of an empty string adds nothing worth a bracket.
+	const context: { string } = {}
+	for (_, c in f.context) {
+		if (c != "") {
+			table.insert(context, c)
+		}
+	}
+	if (#context > 0) {
+		text ..= ` [{table.concat(context, "; ")}]`
 	}
 	return text
 }
@@ -190,6 +225,7 @@ function M.declare(suite: Suite, name: string, spec: TestsSpec) {
 				return
 			}
 			const include: { string } = spec.cases or {}
+			const tagged: { string } = spec.tags or {}
 			const exclude: { string } = spec.exclude or {}
 			const serialGlobs: { string } = spec.serial or {}
 			const history: CaseTimes = json.readAs(historyFile(ctx, name)) or {}
@@ -205,8 +241,11 @@ function M.declare(suite: Suite, name: string, spec: TestsSpec) {
 			for (i, c in listed) {
 				byName[c.name] = c
 				order[c.name] = i
-				const chosen = (#include == 0 || util.matchesAny(include, c.name)) && !util.matchesAny(exclude, c.name)
-				if (chosen && !c.skip) {
+				const chosen = (#include == 0 || util.matchesAny(include, c.name)) && (#tagged == 0 || hasTag(c.tags, tagged))
+					&& !util.matchesAny(exclude, c.name)
+				if (chosen && c.skip) {
+					outcomes[c.name] = { name = c.name, status = "skipped", seconds = 0, failures = {}, messages = {} }
+				} else if (chosen) {
 					if (util.matchesAny(serialGlobs, c.name)) {
 						table.insert(serial, c)
 					} else {
@@ -284,12 +323,13 @@ function M.declare(suite: Suite, name: string, spec: TestsSpec) {
 				for (_, caseName in progress.started) {
 					if (progress.ended[caseName] == nil) {
 						const ending = if (run.signal != nil) `was killed by signal {run.signal}` else `exited with code {run.code or "?"}`
+						const lastOutput = tail(log, 20)
 						outcomes[caseName] = {
 							name = caseName,
 							status = if (timedOut == caseName) "timeout" else "crashed",
 							seconds = if (timedOut == caseName) host.monotonic() - since else 0,
 							failures = {},
-							messages = { if (timedOut == caseName) `ran past its {caseTimeout(byName[caseName])} s timeout` else `the process {ending} in this case; the end of its output:\n{tail(log, 20)}` },
+							messages = { if (timedOut == caseName) `ran past its {caseTimeout(byName[caseName])} s timeout and was ended` else `its process {ending} during the case; the end of its output:\n{lastOutput}` },
 						}
 					}
 				}
@@ -311,7 +351,7 @@ function M.declare(suite: Suite, name: string, spec: TestsSpec) {
 								status = "crashed",
 								seconds = 0,
 								failures = {},
-								messages = { `the process ended before this case ran (exited with code {run.code or "?"}); the end of its output:\n{tail(log, 20)}` },
+								messages = { `its process ended (exit code {run.code or "?"}) before the case started; the end of its output:\n{tail(log, 20)}` },
 							}
 						} else {
 							table.insert(rest, tc)
@@ -326,7 +366,7 @@ function M.declare(suite: Suite, name: string, spec: TestsSpec) {
 			local function takeBatch(queue: { TestCase }): { TestCase } {
 				const batch: { TestCase } = {}
 				let seconds = 0
-				while (#queue > 0 && (#batch == 0 || seconds < batchSeconds) && #batch < 200) {
+				while (#queue > 0 && (#batch == 0 || seconds < batchSeconds) && #batch < kMaxBatchCases) {
 					const tc = table.remove(queue, 1) :: TestCase
 					table.insert(batch, tc)
 					seconds += median[tc.name] or 0.05
@@ -345,12 +385,14 @@ function M.declare(suite: Suite, name: string, spec: TestsSpec) {
 			}
 
 			// No more workers than there are batches to give them.
-			let estimate = 0
-			for (_, tc in parallel) {
-				estimate += median[tc.name] or 0.05
+			const preview = table.clone(parallel)
+			let expectedBatches = 0
+			while (#preview > 0) {
+				takeBatch(preview)
+				expectedBatches += 1
 			}
 			const wanted = spec.workers or math.max(1, math.min(16, math.floor(host.cores() / 2)))
-			const workers = math.max(1, math.min(wanted, #parallel, math.ceil(estimate / batchSeconds)))
+			const workers = math.max(1, math.min(wanted, expectedBatches))
 			if (#parallel > 0) {
 				for (i = 1, workers) {
 					ctx:step(`w{i}`, {
@@ -413,26 +455,27 @@ function M.declare(suite: Suite, name: string, spec: TestsSpec) {
 				if (outcome != nil) {
 					counts[outcome.status] = (counts[outcome.status] or 0) + 1
 					table.insert(ctx.result.tests, { name = tc.name, seconds = outcome.seconds, status = outcome.status, file = tc.file, line = tc.line })
-					const where = if (tc.file != nil) ` ({tc.file}:{tc.line or 0})` else ""
+					const where = if (tc.file != nil) ` ({shown(ctx.root, tc.file :: string)}:{tc.line or 0})` else ""
 					if (outcome.status == "fail") {
 						const f = outcome.failures[1]
-						const more = if (#outcome.failures > 1) ` (+{#outcome.failures - 1} more)` else ""
-						ctx:finding("test", `{tc.name}: {if (f != nil) failureText(f) else "failed"}{more}`)
+						const more = if (#outcome.failures > 1) ` (and {plural(#outcome.failures - 1, "more failure")})` else ""
+						ctx:finding("test", `{tc.name}: {if (f != nil) failureText(ctx.root, f) else "failed"}{more}`)
 					} else if (outcome.status == "crashed" || outcome.status == "timeout") {
 						ctx:finding(`test_{outcome.status}`, `{tc.name}{where}: {outcome.messages[#outcome.messages] or outcome.status}`)
 					} else if (outcome.status == "flaky") {
 						const f = outcome.failures[1]
-						ctx:finding("test_flaky", `{tc.name}: failed beside other cases and passed alone (state shared between cases?){if (f != nil) ": " .. failureText(f) else ""}`, "warning")
+						ctx:finding("test_flaky", `{tc.name}: failed beside other cases but passed on its own, so it may depend on state another case leaves behind{if (f != nil) " (" .. failureText(ctx.root, f) .. ")" else ""}`, "warning")
 					}
 				}
 			}
 			const parts: { string } = {}
-			for (_, status in { "pass", "fail", "crashed", "timeout", "flaky" }) {
-				if (counts[status] != nil) {
-					table.insert(parts, `{counts[status]} {status}`)
+			for (_, entry in { { "pass", "passed" }, { "fail", "failed" }, { "crashed", "crashed" }, { "timeout", "timed out" },
+				{ "flaky", "flaky" }, { "skipped", "skipped" } }) {
+				if (counts[entry[1]] != nil) {
+					table.insert(parts, `{counts[entry[1]]} {entry[2]}`)
 				}
 			}
-			ctx:log(`hamr tests: {#listed} case(s) listed, {table.concat(parts, ", ")}, {batches} batch(es) on {workers} worker(s)`)
+			ctx:log(`{plural(#listed, "case")}: {table.concat(parts, ", ")}; {plural(batches, "batch", "batches")} on {plural(workers, "worker")}`)
 
 			// Each case's recent times, for its median next run.
 			for (_, tc in listed) {
