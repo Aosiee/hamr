@@ -38,6 +38,8 @@ export type TestTime = {
 	name: string,
 	seconds: number,
 	status: string,
+	file: string?,
+	line: number?,
 }
 
 // status: pass | fail | timeout | blocked | skipped | interrupted
@@ -94,6 +96,8 @@ export type Context = {
 	root: string,
 	// This run's directory.
 	out: string,
+	// The directory every run of the suite shares (the history lives there).
+	suiteOut: string,
 	vars: { [string]: string },
 	result: StepResult,
 	run: (self: Context, command: { string }, options: RunOptions?) -> Run,

@@ -1,0 +1,121 @@
+// The adapter for binaries on hamr's C++ library (hamr/test.h): it lists
+// with `--list-json <file>`, runs a batch with `--run <ids> --events <file>`,
+// and reads the events file, one JSON object a line, written as each case
+// goes.
+
+const types = require("@hamr/types")
+const util = require("@hamr/util")
+const json = require("@hamr/json")
+const tests = require("@hamr/tests")
+type Context = types.Context
+type TestCase = tests.TestCase
+type Target = tests.Target
+type Invocation = tests.Invocation
+type Progress = tests.Progress
+type CaseOutcome = tests.CaseOutcome
+type CaseFailure = tests.CaseFailure
+
+type Event = {
+	event: string,
+	name: string?,
+	status: string?,
+	seconds: number?,
+	kind: string?,
+	file: string?,
+	line: number?,
+	expression: string?,
+	expanded: string?,
+	message: string?,
+	context: { string }?,
+	subcase: string?,
+	text: string?,
+	timeout: number?,
+	skip: boolean?,
+	tags: string?,
+}
+
+local function discover(ctx: Context, target: Target, dir: string): ({ TestCase }?, string?) {
+	const file = host.join(dir, "cases.jsonl")
+	const argv = { target.binary }
+	for (_, a in target.args) {
+		table.insert(argv, a)
+	}
+	table.insert(argv, "--list-json")
+	table.insert(argv, file)
+	const run = ctx:run(argv, { cwd = target.cwd, env = target.env, allowFail = true, log = host.join(dir, "list.log") })
+	if (run.code != 0) {
+		return nil, `{util.commandLine(argv)} exited with code {run.code or "?"}: {table.concat(util.tail(host.read(host.join(dir, "list.log")) or "", 5), " / ")}`
+	}
+	const cases: { TestCase } = {}
+	for (_, line in util.lines(host.read(file) or "")) {
+		const e: Event? = json.decodeAs(line)
+		if (e != nil && e.name != nil) {
+			table.insert(cases, { name = e.name :: string, file = e.file, line = e.line, timeout = e.timeout, skip = e.skip, tags = e.tags })
+		}
+	}
+	return cases, nil
+}
+
+local function prepare(ctx: Context, target: Target, batch: { TestCase }, dir: string, index: number): Invocation {
+	const ids = host.join(dir, `batch-{index}.cases`)
+	const events = host.join(dir, `batch-{index}.events`)
+	const names: { string } = {}
+	for (_, c in batch) {
+		table.insert(names, c.name)
+	}
+	host.write(ids, table.concat(names, "\n") .. "\n")
+	host.write(events, "")
+	const argv = { target.binary }
+	for (_, a in target.args) {
+		table.insert(argv, a)
+	}
+	for (_, a in { "--run", ids, "--events", events, "--quiet" }) {
+		table.insert(argv, a)
+	}
+	return { argv = argv, state = { events = events } }
+}
+
+local function read(invocation: Invocation): Progress {
+	const progress: Progress = { started = {}, ended = {}, current = nil }
+	let current: CaseOutcome? = nil
+	for (_, line in util.lines(host.read(invocation.state.events) or "")) {
+		const e: Event? = json.decodeAs(line)
+		if (e == nil) {
+			continue
+		}
+		if (e.event == "case-start" && e.name != nil) {
+			const name = e.name :: string
+			table.insert(progress.started, name)
+			current = { name = name, status = "running", seconds = 0, failures = {}, messages = {} }
+			progress.current = name
+		} else if (e.event == "failure" && current != nil) {
+			const f: CaseFailure = {
+				kind = e.kind or "check",
+				file = e.file or "?",
+				line = e.line or 0,
+				expression = e.expression or "",
+				expanded = e.expanded or "",
+				message = e.message or "",
+				context = e.context or {},
+				subcase = e.subcase or "",
+			}
+			table.insert(current.failures, f)
+		} else if (e.event == "message" && current != nil) {
+			table.insert(current.messages, e.text or "")
+		} else if (e.event == "case-end" && current != nil) {
+			current.status = e.status or "fail"
+			current.seconds = e.seconds or 0
+			progress.ended[current.name] = current
+			current = nil
+			progress.current = nil
+		}
+	}
+	return progress
+}
+
+return {
+	name = "native",
+	discover = discover,
+	prepare = prepare,
+	read = read,
+}

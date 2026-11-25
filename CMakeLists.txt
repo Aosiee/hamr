@@ -61,3 +61,16 @@ target_include_directories(hamr PRIVATE src)
 target_link_libraries(hamr PRIVATE hamr_cluau Luau.VM Luau.Compiler Luau.Analysis)
 target_compile_options(hamr PRIVATE -Wall -Wextra)
 target_compile_definitions(hamr PRIVATE HAMR_VERSION="0.1.0")
+
+# hamr's C++ test library: header-only.
+add_library(hamr_test INTERFACE)
+target_include_directories(hamr_test INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(hamr_test INTERFACE cxx_std_17)
+add_library(hamr::test ALIAS hamr_test)
+
+option(HAMR_BUILD_TESTS "Build the sample C++ suite hamr's own suite runs" ${PROJECT_IS_TOP_LEVEL})
+if(HAMR_BUILD_TESTS)
+    add_executable(hamr_sample_cases tests/cpp/sample_cases.cpp)
+    target_link_libraries(hamr_sample_cases PRIVATE hamr_test)
+    target_compile_options(hamr_sample_cases PRIVATE -Wall -Wextra)
+endif()

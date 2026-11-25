@@ -178,6 +178,76 @@ The critical path is the chain of top-level steps that set the wall time.
 It starts at the step that ended last and goes back through what ended just
 before each one started: a need, or the step whose resources it waited for.
 
+## Test cases
+
+`hamr.tests(suite, name, spec)` declares a step that runs a test target's
+cases side by side. `hamr test <binary> [--case <glob>] [--exclude-case <glob>]
+[--workers <n>] [--timeout <s>] [-- args]` does the same for one binary
+without a suite.
+
+- **Batches:** the cases go to worker sub-steps (`workers`, default half the
+  cores, at most 16) in batches of about `batchSeconds` (2) by each case's
+  recent median, the longest first. Each batch is a process of its own.
+- **Isolation:** a case that crashes is `crashed` (the end of its output in
+  the finding), and a case over its timeout (`timeout`, default 60 s, or the
+  case's own) is ended with its process as `timeout`. Either way the rest of
+  its batch runs again in a new process.
+- **Flaky cases:** a case that fails beside other cases runs once more
+  alone. If it passes alone it is `flaky`: a warning, never a pass.
+- **Serial cases:** the cases matching `serial` run alone, after the rest.
+- **Selection:** `cases` and `exclude` (globs) choose the cases; a case
+  marked skip is listed but not run.
+- **Results:** every case run is in the step's `tests` (name, status, time,
+  file, line). A failed, crashed or timed-out case is an error finding, a
+  flaky one a warning. Each case's last ten passing times are kept in
+  `<out>/cases/<step>.json` for its median.
+
+| Field | |
+|---|---|
+| `adapter` | The language or framework (default `native`: hamr's C++ library). |
+| `binary`, `args`, `env`, `cwd` | The target and how it runs. |
+| `workers`, `workerCpu` | Worker processes, and the `cpu` share each takes. |
+| `timeout`, `batchSeconds` | Per case, and a batch's length. |
+| `budget`, `stepTimeout` | The whole step's. |
+| `serial`, `cases`, `exclude`, `rerun` | As above (`rerun = false`: no alone re-run). |
+| `tier`, `needs`, `paths`, `meta`, `doc`, `resources` | As for any step. |
+
+### Adapters
+
+An adapter is a cluau table: `name`, `discover(ctx, target, dir)` (the
+cases), `prepare(ctx, target, batch, dir, index)` (the command a batch
+runs, and the files it reports through), and `read(invocation)` (what the
+batch has done so far: the cases started, the ones finished with their
+results, the one in progress). `hamr.registerTestAdapter(adapter)` makes
+one available; `adapter = "<name>"` also loads `@hamr/test_<name>`.
+
+### hamr's C++ library: `hamr/test.h`
+
+One header, C++17, the standard library only (`include/hamr/test.h`; CMake
+target `hamr::test`).
+
+- `TEST_CASE("name")`, with decorators: `* hamr::test::timeout(s)`,
+  `* hamr::test::skip()`, `* hamr::test::tags("...")`.
+- `CHECK`, `REQUIRE`, `WARN` and their `_FALSE` / `_MESSAGE` forms (a
+  message streams: `CHECK_MESSAGE(ok, "n = " << n)`), `CHECK_EQ`/`_NE`/`_LT`/
+  `_LE`/`_GT`/`_GE` and the `REQUIRE_` ones, `CHECK_THROWS`, `CHECK_THROWS_AS`,
+  `CHECK_NOTHROW` and the `REQUIRE_` ones. A comparison reports both values
+  (with `operator<<` when the type has one).
+- `INFO(...)` and `CAPTURE(x)` add context to the failures after them in the
+  same scope; `MESSAGE(...)` records a line; `FAIL(...)` fails and ends the
+  case, `FAIL_CHECK(...)` fails and goes on.
+- `hamr::test::Approx(x)` (`.epsilon(e)`, `.scale(s)`).
+- `SUBCASE("name")`: the case runs once per leaf subcase.
+- A REQUIRE that fails ends its case by an exception; built without
+  exceptions, it reports the case and ends the process (exit code 3), and
+  hamr runs the rest of the batch in a new one.
+- `#define HAMR_TEST_MAIN` before the include gives the default `main`; a
+  custom one calls `hamr::test::Run(argc, argv)`.
+- The binary on its own: `--case <glob>`, `--exclude <glob>`, `--list`,
+  `--no-skip`, `--quiet`. hamr drives it with `--list-json <file>` and
+  `--run <file> --events <file>` (JSON lines: `case-start`, `failure`,
+  `message`, `case-end`).
+
 ## The host API
 
 `host` is a global (declared in `types/host.d.luau`). The standard library

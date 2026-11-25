@@ -42,7 +42,7 @@ const run = object({
 	argv = array(str()), startedAt = num(), code = num(), signal = num(), timedOut = bool(), seconds = num(),
 	cpuSeconds = num(), peakRssMB = num(), leftProcesses = bool(), log = str(),
 }, { "code", "signal" })
-const test = object({ name = str(), seconds = num(), status = str() })
+const test = object({ name = str(), seconds = num(), status = str(), file = str(), line = num() }, { "file", "line" })
 
 // A step refers to itself through `children`; the validator follows the
 // name "step" for it.

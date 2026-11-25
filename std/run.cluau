@@ -57,6 +57,8 @@ export type Plan = {
 	skipped: { [string]: string },
 	jobs: number,
 	runDir: string,
+	// The output directory every run of the suite shares (its history).
+	outDir: string,
 	medians: { [string]: number },
 	quiet: boolean,
 }
@@ -307,6 +309,7 @@ function M.execute(plan: Plan): Outcome {
 			name = node.name,
 			root = suite.root,
 			out = plan.runDir,
+			suiteOut = plan.outDir,
 			vars = suite.vars,
 			result = node.result,
 			run = function(self: Context, command: { string }, options: RunOptions?): Run {

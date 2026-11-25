@@ -1,0 +1,454 @@
+// Test cases: a step whose cases an adapter lists and runs. The cases go to
+// worker sub-steps in batches, each batch a process of its own: a case that
+// crashes or hangs costs that case, and the rest of its batch runs again in
+// a new process. A case that fails beside others is run once more alone; if
+// it passes then, it is reported flaky (shared state), never passed.
+//
+// The core knows no language. An adapter (`@hamr/test_<name>`, or one a
+// suite registers) says how to list a target's cases, how to start a batch
+// of them, and how to read what a batch has done so far.
+
+const types = require("@hamr/types")
+const util = require("@hamr/util")
+const json = require("@hamr/json")
+type Context = types.Context
+type Suite = types.Suite
+type Resources = types.Resources
+type Proc = types.Proc
+type Run = types.Run
+
+const M = {}
+
+export type TestCase = {
+	name: string,
+	file: string?,
+	line: number?,
+	// Seconds before hamr ends the case (0 or absent: the suite's default).
+	timeout: number?,
+	skip: boolean?,
+	tags: string?,
+}
+
+export type CaseFailure = {
+	kind: string,
+	file: string,
+	line: number,
+	expression: string,
+	expanded: string,
+	message: string,
+	context: { string },
+	subcase: string,
+}
+
+export type CaseOutcome = {
+	name: string,
+	// pass | fail | crashed | timeout | flaky
+	status: string,
+	seconds: number,
+	failures: { CaseFailure },
+	messages: { string },
+}
+
+export type Target = {
+	binary: string,
+	args: { string },
+	env: { [string]: string },
+	cwd: string?,
+}
+
+// What a batch runs as. `state` is the adapter's own (the files it reads).
+export type Invocation = {
+	argv: { string },
+	env: { [string]: string }?,
+	state: { [string]: string },
+}
+
+// What a batch has done so far: the cases it started (in order), the ones
+// it finished, and the one it is in.
+export type Progress = {
+	started: { string },
+	ended: { [string]: CaseOutcome },
+	current: string?,
+}
+
+export type Adapter = {
+	name: string,
+	discover: (ctx: Context, target: Target, dir: string) -> ({ TestCase }?, string?),
+	prepare: (ctx: Context, target: Target, batch: { TestCase }, dir: string, index: number) -> Invocation,
+	read: (invocation: Invocation) -> Progress,
+}
+
+export type TestsSpec = {
+	// The adapter's name (default "native": hamr's C++ library).
+	adapter: string?,
+	binary: string,
+	args: { string }?,
+	env: { [string]: string }?,
+	cwd: string?,
+	tier: string?,
+	needs: { string }?,
+	paths: { string }?,
+	meta: { [string]: string }?,
+	doc: string?,
+	// The step's own resources (tags it holds); each worker takes `workerCpu`.
+	resources: Resources?,
+	// Worker processes side by side (default: half the cores, at most 16).
+	workers: number?,
+	workerCpu: number?,
+	// Seconds a case may take (default 60), unless the case says otherwise.
+	timeout: number?,
+	// The whole step's budget and timeout.
+	budget: number,
+	stepTimeout: number?,
+	// About how many seconds of cases a batch holds (default 2).
+	batchSeconds: number?,
+	// Cases (globs) that run alone, after the rest.
+	serial: { string }?,
+	// Only these cases (globs), and none of these.
+	cases: { string }?,
+	exclude: { string }?,
+	// Run a failed case again alone (default true).
+	rerun: boolean?,
+}
+
+M.adapters = {} :: { [string]: Adapter }
+
+function M.register(adapter: Adapter) {
+	M.adapters[adapter.name] = adapter
+}
+
+local function adapterNamed(name: string): Adapter? {
+	const known = M.adapters[name]
+	if (known != nil) {
+		return known
+	}
+	const ok, loaded = pcall(function(): Adapter {
+		return host.require(`@hamr/test_{name}`) :: any // allow-any: an adapter module's value is the adapter
+	})
+	if (ok && loaded != nil) {
+		M.register(loaded)
+		return loaded
+	}
+	return nil
+}
+
+type CaseTimes = { [string]: { number } }
+
+local function historyFile(ctx: Context, name: string): string {
+	return host.join(ctx.suiteOut, "cases", util.fileName(name) .. ".json")
+}
+
+local function tail(path: string, count: number): string {
+	return table.concat(util.tail(host.read(path) or "", count), "\n")
+}
+
+local function failureText(f: CaseFailure): string {
+	let text = `{f.file}:{f.line}:`
+	if (f.expression != "") {
+		text ..= ` {f.expression}`
+	}
+	if (f.expanded != "") {
+		text ..= ` with values {f.expanded}`
+	}
+	if (f.message != "") {
+		text ..= ` {f.message}`
+	}
+	if (f.subcase != "") {
+		text ..= ` (in {f.subcase})`
+	}
+	if (#f.context > 0) {
+		text ..= ` [{table.concat(f.context, "; ")}]`
+	}
+	return text
+}
+
+// Declares the step.
+function M.declare(suite: Suite, name: string, spec: TestsSpec) {
+	suite:step(name, {
+		tier = spec.tier,
+		needs = spec.needs,
+		paths = spec.paths,
+		meta = spec.meta,
+		doc = spec.doc,
+		resources = spec.resources or { cpu = 0 },
+		timeout = spec.stepTimeout or 3600,
+		budget = spec.budget,
+		run = function(ctx: Context) {
+			const adapter = adapterNamed(spec.adapter or "native")
+			if (adapter == nil) {
+				ctx:fail(`no test adapter named "{spec.adapter or "native"}"`)
+				return
+			}
+			const binary = if (util.startsWith(spec.binary, "/")) spec.binary else host.join(ctx.root, spec.binary)
+			const target: Target = { binary = binary, args = spec.args or {}, env = spec.env or {}, cwd = spec.cwd }
+			const dir = host.join(ctx.out, "tests", util.fileName(name))
+			host.mkdir(dir)
+
+			const listed, err = adapter.discover(ctx, target, dir)
+			if (listed == nil) {
+				ctx:fail(`could not list the cases: {err or "?"}`)
+				return
+			}
+			const include: { string } = spec.cases or {}
+			const exclude: { string } = spec.exclude or {}
+			const serialGlobs: { string } = spec.serial or {}
+			const history: CaseTimes = json.readAs(historyFile(ctx, name)) or {}
+			const median: { [string]: number } = {}
+			for (caseName, times in history) {
+				median[caseName] = util.median(times) or 0
+			}
+			const byName: { [string]: TestCase } = {}
+			const parallel: { TestCase } = {}
+			const serial: { TestCase } = {}
+			const outcomes: { [string]: CaseOutcome } = {}
+			const order: { [string]: number } = {}
+			for (i, c in listed) {
+				byName[c.name] = c
+				order[c.name] = i
+				const chosen = (#include == 0 || util.matchesAny(include, c.name)) && !util.matchesAny(exclude, c.name)
+				if (chosen && !c.skip) {
+					if (util.matchesAny(serialGlobs, c.name)) {
+						table.insert(serial, c)
+					} else {
+						table.insert(parallel, c)
+					}
+				}
+			}
+			// The long cases first, so they start while the short ones fill in.
+			local function sortLongest(list: { TestCase }) {
+				table.sort(list, function(a: TestCase, b: TestCase): boolean {
+					const ma = median[a.name] or 0
+					const mb = median[b.name] or 0
+					if (ma != mb) {
+						return ma > mb
+					}
+					return order[a.name] < order[b.name]
+				})
+			}
+			sortLongest(parallel)
+
+			const defaultTimeout = spec.timeout or 60
+			const batchSeconds = spec.batchSeconds or 2
+			const attempts: { [string]: number } = {}
+			let batches = 0
+
+			local function caseTimeout(c: TestCase): number {
+				const t = c.timeout
+				return if (t != nil && t > 0) t else defaultTimeout
+			}
+
+			// Runs one batch to its end, records what it did, and returns the
+			// cases that never started (for another worker).
+			local function runBatch(c: Context, batch: { TestCase }): { TestCase } {
+				batches += 1
+				const index = batches
+				const invocation = adapter.prepare(c, target, batch, dir, index)
+				const log = host.join(dir, `batch-{index}.log`)
+				let env: { [string]: string } = {}
+				for (k, v in target.env) {
+					env[k] = v
+				}
+				const extra: { [string]: string } = invocation.env or {}
+				for (k, v in extra) {
+					env[k] = v
+				}
+				const proc: Proc = c:start(invocation.argv, { env = env, cwd = target.cwd, log = log, allowFail = true })
+				let current: string? = nil
+				let since = host.monotonic()
+				let timedOut: string? = nil
+				while (!proc:done()) {
+					c:sleep(0.1)
+					const progress = adapter.read(invocation)
+					if (progress.current != current) {
+						current = progress.current
+						since = host.monotonic()
+					} else if (current != nil) {
+						const tc = byName[current :: string]
+						if (tc != nil && host.monotonic() - since > caseTimeout(tc)) {
+							timedOut = current
+							proc:kill()
+							break
+						}
+					}
+				}
+				const run: Run = proc:wait()
+				const progress = adapter.read(invocation)
+				const started: { [string]: boolean } = {}
+				for (_, caseName in progress.started) {
+					started[caseName] = true
+				}
+				for (caseName, outcome in progress.ended) {
+					outcomes[caseName] = outcome
+				}
+				// The case it was in when it ended, if it never finished it.
+				for (_, caseName in progress.started) {
+					if (progress.ended[caseName] == nil) {
+						const ending = if (run.signal != nil) `was killed by signal {run.signal}` else `exited with code {run.code or "?"}`
+						outcomes[caseName] = {
+							name = caseName,
+							status = if (timedOut == caseName) "timeout" else "crashed",
+							seconds = if (timedOut == caseName) host.monotonic() - since else 0,
+							failures = {},
+							messages = { if (timedOut == caseName) `ran past its {caseTimeout(byName[caseName])} s timeout` else `the process {ending} in this case; the end of its output:\n{tail(log, 20)}` },
+						}
+					}
+				}
+				const rest: { TestCase } = {}
+				let startedAny = false
+				for (_, tc in batch) {
+					if (started[tc.name]) {
+						startedAny = true
+					}
+				}
+				for (_, tc in batch) {
+					if (!started[tc.name]) {
+						attempts[tc.name] = (attempts[tc.name] or 0) + 1
+						// A batch that ran no case at all failed before its first
+						// one: its first case takes the blame, the others go back.
+						if (!startedAny && tc == batch[1] || attempts[tc.name] > 3) {
+							outcomes[tc.name] = {
+								name = tc.name,
+								status = "crashed",
+								seconds = 0,
+								failures = {},
+								messages = { `the process ended before this case ran (exited with code {run.code or "?"}); the end of its output:\n{tail(log, 20)}` },
+							}
+						} else {
+							table.insert(rest, tc)
+						}
+					}
+				}
+				return rest
+			}
+
+			// The next batch: cases from the front until about batchSeconds of
+			// them (by their medians; an unknown case counts as 0.05 s).
+			local function takeBatch(queue: { TestCase }): { TestCase } {
+				const batch: { TestCase } = {}
+				let seconds = 0
+				while (#queue > 0 && (#batch == 0 || seconds < batchSeconds) && #batch < 200) {
+					const tc = table.remove(queue, 1) :: TestCase
+					table.insert(batch, tc)
+					seconds += median[tc.name] or 0.05
+				}
+				return batch
+			}
+
+			local function drain(c: Context, queue: { TestCase }) {
+				while (#queue > 0) {
+					const batch = takeBatch(queue)
+					const rest = runBatch(c, batch)
+					for (i = #rest, 1, -1) {
+						table.insert(queue, 1, rest[i])
+					}
+				}
+			}
+
+			// No more workers than there are batches to give them.
+			let estimate = 0
+			for (_, tc in parallel) {
+				estimate += median[tc.name] or 0.05
+			}
+			const wanted = spec.workers or math.max(1, math.min(16, math.floor(host.cores() / 2)))
+			const workers = math.max(1, math.min(wanted, #parallel, math.ceil(estimate / batchSeconds)))
+			if (#parallel > 0) {
+				for (i = 1, workers) {
+					ctx:step(`w{i}`, {
+						resources = { cpu = spec.workerCpu or 1 },
+						run = function(c: Context) {
+							drain(c, parallel)
+						},
+					})
+				}
+				ctx:wait()
+			}
+			if (#serial > 0) {
+				ctx:step("serial", {
+					resources = { cpu = spec.workerCpu or 1 },
+					run = function(c: Context) {
+						for (_, tc in serial) {
+							drain(c, { tc })
+						}
+					},
+				})
+				ctx:wait()
+			}
+
+			// A case that failed beside others runs once more alone.
+			const failed: { TestCase } = {}
+			for (caseName, outcome in outcomes) {
+				if (outcome.status == "fail" && spec.rerun != false) {
+					table.insert(failed, byName[caseName])
+				}
+			}
+			if (#failed > 0) {
+				const first: { [string]: CaseOutcome } = {}
+				for (_, tc in failed) {
+					first[tc.name] = outcomes[tc.name]
+				}
+				ctx:step("alone", {
+					resources = { cpu = spec.workerCpu or 1 },
+					run = function(c: Context) {
+						for (_, tc in failed) {
+							drain(c, { tc })
+						}
+					},
+				})
+				ctx:wait()
+				for (_, tc in failed) {
+					const again = outcomes[tc.name]
+					if (again != nil && again.status == "pass") {
+						again.status = "flaky"
+						again.failures = first[tc.name].failures
+					} else {
+						outcomes[tc.name] = first[tc.name]
+					}
+				}
+			}
+
+			// The results, in the cases' listed order.
+			const counts: { [string]: number } = {}
+			for (_, tc in listed) {
+				const outcome = outcomes[tc.name]
+				if (outcome != nil) {
+					counts[outcome.status] = (counts[outcome.status] or 0) + 1
+					table.insert(ctx.result.tests, { name = tc.name, seconds = outcome.seconds, status = outcome.status, file = tc.file, line = tc.line })
+					const where = if (tc.file != nil) ` ({tc.file}:{tc.line or 0})` else ""
+					if (outcome.status == "fail") {
+						const f = outcome.failures[1]
+						const more = if (#outcome.failures > 1) ` (+{#outcome.failures - 1} more)` else ""
+						ctx:finding("test", `{tc.name}: {if (f != nil) failureText(f) else "failed"}{more}`)
+					} else if (outcome.status == "crashed" || outcome.status == "timeout") {
+						ctx:finding(`test_{outcome.status}`, `{tc.name}{where}: {outcome.messages[#outcome.messages] or outcome.status}`)
+					} else if (outcome.status == "flaky") {
+						const f = outcome.failures[1]
+						ctx:finding("test_flaky", `{tc.name}: failed beside other cases and passed alone (state shared between cases?){if (f != nil) ": " .. failureText(f) else ""}`, "warning")
+					}
+				}
+			}
+			const parts: { string } = {}
+			for (_, status in { "pass", "fail", "crashed", "timeout", "flaky" }) {
+				if (counts[status] != nil) {
+					table.insert(parts, `{counts[status]} {status}`)
+				}
+			}
+			ctx:log(`hamr tests: {#listed} case(s) listed, {table.concat(parts, ", ")}, {batches} batch(es) on {workers} worker(s)`)
+
+			// Each case's recent times, for its median next run.
+			for (_, tc in listed) {
+				const outcome = outcomes[tc.name]
+				if (outcome != nil && outcome.status == "pass") {
+					const times = history[tc.name] or {}
+					table.insert(times, math.floor(outcome.seconds * 1000 + 0.5) / 1000)
+					while (#times > 10) {
+						table.remove(times, 1)
+					}
+					history[tc.name] = times
+				}
+			}
+			host.write(historyFile(ctx, name), json.encode(json.object(history)) .. "\n")
+		},
+	})
+}
+
+return M

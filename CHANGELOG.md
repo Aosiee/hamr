@@ -23,6 +23,10 @@ The first release.
 - A step's timeout also stops cluau code that never yields.
 - Background processes in a step (`ctx:start`), `ctx:sleep` and
   `ctx:waitUntil`, free ports, unset environment variables.
+- Test cases: `hamr.tests(...)` and `hamr test <binary>` (workers, batches,
+  crash and hang isolation, the alone re-run of a failure, per-case
+  medians), adapters in cluau, and hamr's C++ test library
+  `include/hamr/test.h`.
 - A process group gets five seconds to empty after its leader ends before
   what is left is a stray.
 - `hamr run --dry-run`; `--changed` asks the repository nearest the suite.

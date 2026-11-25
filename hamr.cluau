@@ -85,6 +85,75 @@ suite:step("changed", {
 	},
 })
 
+// The C++ test library and the case scheduler, through `hamr test` on the
+// sample binary: every case's status with each failure mode switched on,
+// a clean run with them off, and the subcases' order run on its own.
+suite:step("test-library", {
+	doc = "hamr/test.h and the case scheduler: failures, a crash, a hang, a flaky case, subcases.",
+	needs = { "build" },
+	timeout = 120,
+	budget = 15,
+	resources = { cpu = 2 },
+	run = function(ctx: Context) {
+		const sample = host.join(ctx.root, buildDir, "hamr_sample_cases")
+		const out = host.join(ctx.out, "test-library")
+		const marker = host.join(out, "flaky.marker")
+		host.mkdir(out)
+		const failing = ctx:run({ bin, "test", sample, "--out", host.join(out, "failing"), "--workers", "1", "--quiet" },
+			{ allowFail = true, env = { HAMR_SAMPLE = "fail,require,throw,crash,hang,flaky", HAMR_SAMPLE_MARKER = marker } })
+		if (failing.code != 1) {
+			ctx:fail(`the failing run exited {failing.code}, expected 1`)
+		}
+		const r: Report? = hamr.json.readAs(host.join(out, "failing", "latest.json"))
+		if (r == nil) {
+			ctx:fail("the failing run wrote no report")
+			return
+		}
+		const expected: { [string]: string } = {
+			["passes: the comparisons, Approx and the exception checks"] = "pass",
+			["fails: a check, a message and context"] = "fail",
+			["fails: a require ends the case"] = "fail",
+			["fails: an exception escapes"] = "fail",
+			["crashes"] = "crashed",
+			["hangs"] = "timeout",
+			["flaky: fails beside another case, passes alone"] = "flaky",
+			["subcases: each leaf once"] = "pass",
+			["slow: half a second"] = "pass",
+		}
+		const seen: { [string]: string } = {}
+		for (_, s in reportLib.flatten(r.steps)) {
+			for (_, t in s.tests) {
+				seen[t.name] = t.status
+			}
+		}
+		for (name, status in expected) {
+			if (seen[name] != status) {
+				ctx:fail(`"{name}" is {seen[name] or "missing"}, expected {status}`)
+			}
+		}
+		if (seen["skipped"] != nil) {
+			ctx:fail("the case marked skip ran")
+		}
+		const clean = ctx:run({ bin, "test", sample, "--out", host.join(out, "clean"), "--quiet" }, { allowFail = true })
+		if (clean.code != 0) {
+			ctx:fail(`the clean run exited {clean.code}, expected 0`)
+		}
+		const listing = host.join(out, "subcases.txt")
+		ctx:run({ sample, "--case", "subcases*" }, { log = listing })
+		const order: { string } = {}
+		for (_, line in hamr.util.lines(host.read(listing) or "")) {
+			const what = string.match(line, "MESSAGE: (.+)$")
+			if (what != nil) {
+				table.insert(order, what)
+			}
+		}
+		const got = table.concat(order, ",")
+		if (got != "enter,a,a1,enter,a,a2,enter,b") {
+			ctx:fail(`the subcases ran as {got}, expected enter,a,a1,enter,a,a2,enter,b`)
+		}
+	},
+})
+
 local function stepOf(r: Report, name: string): StepResult? {
 	for (_, s in reportLib.flatten(r.steps)) {
 		if (s.name == name) {

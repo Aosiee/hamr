@@ -42,6 +42,12 @@ hamr has two parts:
 hamr knows nothing about any build system or project. A suite builds with
 whatever its project uses.
 
+hamr also runs test cases: `hamr.tests(...)` in a suite (or `hamr test
+<binary>`) spreads a test binary's cases over worker processes, so a crash
+or a hang costs only its case. C++ tests are written against hamr's own
+library, `include/hamr/test.h` (one header, C++17); other languages plug in
+as adapters written in cluau.
+
 ## Building
 
 hamr needs CMake 3.24, a C++20 compiler and Linux. It builds its own copy of
@@ -108,6 +114,7 @@ does not load.
 | `hamr check [files...]`, `hamr check --std` | Luau's type checker under cluau's strict rules |
 | `hamr exec <script.cluau> [args]` | run a cluau script |
 | `hamr validate <report.json> ...` | check reports against the `hamr/1` schema |
+| `hamr test <binary> [--case G] [--workers N] [-- args]` | run a test binary's cases side by side, a crash or a hang costing only its case |
 
 Exit codes: 0 when everything passed, 1 when a step failed, timed out or was
 blocked, 2 for a usage or preflight error, 130 when interrupted (Ctrl-C

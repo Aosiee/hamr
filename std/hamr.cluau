@@ -10,6 +10,7 @@ const suiteLib = require("@hamr/suite")
 const findings = require("@hamr/findings")
 const json = require("@hamr/json")
 const util = require("@hamr/util")
+const testsLib = require("@hamr/tests")
 
 export type Suite = types.Suite
 export type SuiteOptions = types.SuiteOptions
@@ -26,6 +27,9 @@ export type Resources = types.Resources
 export type Report = types.Report
 export type ReportHook = types.ReportHook
 export type Proc = types.Proc
+export type TestsSpec = testsLib.TestsSpec
+export type TestAdapter = testsLib.Adapter
+export type TestCase = testsLib.TestCase
 
 const M = {
 	version = host.version,
@@ -36,6 +40,16 @@ const M = {
 
 function M.suite(name: string, options: SuiteOptions?): Suite {
 	return suiteLib.new(name, options)
+}
+
+// A step running a test target's cases side by side (see @hamr/tests).
+function M.tests(suite: Suite, name: string, spec: TestsSpec) {
+	testsLib.declare(suite, name, spec)
+}
+
+// Makes an adapter (a language or framework) available by its name.
+function M.registerTestAdapter(adapter: TestAdapter) {
+	testsLib.register(adapter)
 }
 
 return M

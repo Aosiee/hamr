@@ -6,6 +6,7 @@ const run = require("@hamr/run")
 const report = require("@hamr/report")
 const util = require("@hamr/util")
 const schema = require("@hamr/schema")
+const tests = require("@hamr/tests")
 type Suite = types.Suite
 type StepDef = types.StepDef
 type Preflight = types.Preflight
@@ -23,6 +24,10 @@ usage:
   hamr check --std                   type-check hamr's standard library
   hamr exec <script.cluau> [args]    run a cluau script (its module may return a function of the args)
   hamr validate <report.json> ...    check reports against the hamr/1 schema
+  hamr test <binary> [options] [-- args]
+                                     run a test binary's cases side by side, each crash or hang
+                                     costing only its case (--case <glob>, --exclude-case <glob>,
+                                     --workers <n>, --timeout <s>, --adapter <name>)
 
 run options:
   --tier fast|nightly|manual   the steps of that tier and the tiers below it (default fast)
@@ -53,6 +58,12 @@ type Args = {
 	dryRun: boolean,
 	std: boolean,
 	rest: { string },
+	// hamr test
+	cases: { string },
+	excludeCases: { string },
+	workers: number?,
+	caseTimeout: number?,
+	adapter: string?,
 }
 
 local function parse(argv: { string }): (Args?, string?) {
@@ -69,6 +80,8 @@ local function parse(argv: { string }): (Args?, string?) {
 		dryRun = false,
 		std = false,
 		rest = {},
+		cases = {},
+		excludeCases = {},
 	}
 	let i = 2
 	if (a.command == "exec") {
@@ -80,6 +93,12 @@ local function parse(argv: { string }): (Args?, string?) {
 	}
 	while (i <= #argv) {
 		const arg = argv[i]
+		if (arg == "--") {
+			for (j = i + 1, #argv) {
+				table.insert(a.rest, argv[j])
+			}
+			break
+		}
 		const value = argv[i + 1]
 		local function need(): string? {
 			i += 1
@@ -114,6 +133,16 @@ local function parse(argv: { string }): (Args?, string?) {
 			a.force = true
 		} else if (arg == "--dry-run") {
 			a.dryRun = true
+		} else if (arg == "--case") {
+			table.insert(a.cases, need() || "")
+		} else if (arg == "--exclude-case") {
+			table.insert(a.excludeCases, need() || "")
+		} else if (arg == "--workers") {
+			a.workers = tonumber(need() || "")
+		} else if (arg == "--timeout") {
+			a.caseTimeout = tonumber(need() || "")
+		} else if (arg == "--adapter") {
+			a.adapter = need()
 		} else if (arg == "--quiet") {
 			a.quiet = true
 		} else if (arg == "--std") {
@@ -343,12 +372,7 @@ local function stamp(): string {
 	return (string.gsub(host.isoTime(), ":", "-")) .. "_" .. tostring(host.pid())
 }
 
-local function cmdRun(a: Args): number {
-	const suite, err = loadSuite(a.positional[1])
-	if (suite == nil) {
-		print(`hamr: {err}`)
-		return 2
-	}
+local function runSuite(suite: Suite, a: Args): number {
 	const out = outDir(suite, a.out)
 	const skipped, selectErr = select(suite, a)
 	if (skipped == nil) {
@@ -389,6 +413,7 @@ local function cmdRun(a: Args): number {
 		skipped = skipped,
 		jobs = jobs,
 		runDir = runDir,
+		outDir = out,
 		medians = medians.seconds,
 		quiet = a.quiet,
 	})
@@ -449,6 +474,39 @@ local function cmdRun(a: Args): number {
 		return 1
 	}
 	return 0
+}
+
+local function cmdRun(a: Args): number {
+	const suite, err = loadSuite(a.positional[1])
+	if (suite == nil) {
+		print(`hamr: {err}`)
+		return 2
+	}
+	return runSuite(suite, a)
+}
+
+// hamr test <binary> [options] [-- args]: one test binary through the case
+// scheduler, without a suite file.
+local function cmdTest(a: Args): number {
+	const binary = a.positional[1]
+	if (binary == nil) {
+		print("hamr test: name a test binary")
+		return 2
+	}
+	const suite = suiteLib.new("hamr test", { out = ".hamr/test" })
+	suite.root = host.cwd()
+	suite.file = host.absolute(binary)
+	tests.declare(suite, host.basename(binary), {
+		adapter = a.adapter,
+		binary = host.absolute(binary),
+		args = a.rest,
+		workers = a.workers,
+		timeout = a.caseTimeout,
+		cases = if (#a.cases > 0) a.cases else nil,
+		exclude = if (#a.excludeCases > 0) a.excludeCases else nil,
+		budget = 3600,
+	})
+	return runSuite(suite, a)
 }
 
 local function cmdList(a: Args): number {
@@ -634,6 +692,8 @@ function M.main(argv: { string }): number {
 		return cmdExec(a)
 	} else if (a.command == "validate") {
 		return cmdValidate(a)
+	} else if (a.command == "test") {
+		return cmdTest(a)
 	} else if (a.command == "version" || a.command == "--version") {
 		print(`hamr {host.version}`)
 		return 0
