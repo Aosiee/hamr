@@ -6,7 +6,9 @@
 # workspace that already vendors them), else from their repositories at the
 # pinned commits below.
 cmake_minimum_required(VERSION 3.24)
-project(hamr CXX)
+# The version is set once, here: `hamr --version` reports it, and a release
+# tag (vX.Y.Z) must match it.
+project(hamr VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -60,7 +62,7 @@ add_executable(hamr ${HAMR_SOURCES} ${HAMR_EMBED_CPP})
 target_include_directories(hamr PRIVATE src)
 target_link_libraries(hamr PRIVATE hamr_cluau Luau.VM Luau.Compiler Luau.Analysis)
 target_compile_options(hamr PRIVATE -Wall -Wextra)
-target_compile_definitions(hamr PRIVATE HAMR_VERSION="0.1.0")
+target_compile_definitions(hamr PRIVATE HAMR_VERSION="${PROJECT_VERSION}")
 
 # hamr's C++ test library: header-only.
 add_library(hamr_test INTERFACE)

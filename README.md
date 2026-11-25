@@ -1,5 +1,11 @@
 # hamr
 
+[![Linux](https://github.com/Aosiee/hamr/actions/workflows/linux.yml/badge.svg?branch=dev)](https://github.com/Aosiee/hamr/actions/workflows/linux.yml)
+[![Windows: not supported](https://img.shields.io/badge/Windows-not%20supported-lightgrey)](#building)
+[![macOS: not supported](https://img.shields.io/badge/macOS-not%20supported-lightgrey)](#building)
+
+[![Release](https://img.shields.io/github/v/release/Aosiee/hamr)](https://github.com/Aosiee/hamr/releases/latest)
+
 A test runner scripted in [cluau](https://github.com/Aosiee/cluau). A
 project declares its checks once, in a `hamr.cluau` suite. hamr runs them
 side by side where it can and times every step. It writes one report shape
@@ -8,23 +14,27 @@ starts to slow down says so.
 
 ```
 $ hamr run                  # hamr's own suite
-hamr: hamr, fast tier, 5 of 5 steps, -j 32
-[  1/5] pass            25s  build  (budget 1m00s)
-[  2/16] pass           0.0s  selftest  (budget 5.0s)
+hamr: hamr, fast tier, 7 of 7 steps, -j 32
+[  1/7] pass           0.1s  build  (budget 1m00s)
+[  2/22] pass           0.0s  selftest  (budget 5.0s)
 ...
-[ 16/16] pass           3.6s  samples  (budget 15s)
 
   status      time  share     cpu    rss  budget  vs med  step
-  pass          25s    87%   5m51s   521M   1m00s     new *build
-  pass         3.6s    13%    0.0s     0M     15s     new *samples
-  pass         3.1s           0.0s    28M       -     new    history
-  pass         1.5s           0.0s    28M       -     new    parallel
+  pass         6.3s    99%    0.0s     0M     15s   +103% *samples
+  pass         5.0s           0.6s   209M       -   +4.5s    measure
+  pass         3.1s           0.0s    28M       -     -0%    history
+  ...
+  pass         3.0s    47%    0.1s    28M     15s     +0%  test-library
+  pass         0.1s     1%    0.0s    28M   1m00s   -0.1s *build
   ...
   * critical path: build -> samples
 
-hamr: 16 passed in 28s (budget 2m00s); cpu 5m52s
-hamr: report .hamr/runs/2026-11-24T00-46-15_343518/report.json
+hamr: 22 passed in 6.3s (budget 2m00s); cpu 2.0s
+hamr: report .hamr/runs/2026-11-24T21-00-13_2764914/report.json
 ```
+
+The step count grows as it runs: a step that fans out into sub-steps
+(`samples` here) adds them when it starts.
 
 hamr has two parts:
 
@@ -47,6 +57,21 @@ hamr also runs test cases: `hamr.tests(...)` in a suite (or `hamr test
 or a hang costs only its case. C++ tests are written against hamr's own
 library, `include/hamr/test.h` (one header, C++17); other languages plug in
 as adapters written in cluau.
+
+## Installing
+
+Each release on the [releases page](https://github.com/Aosiee/hamr/releases)
+has a Linux x86-64 download: the `hamr` binary (its standard library is
+built in, so it is the only file needed), the reference, and
+`include/hamr/test.h`, the C++ test library.
+
+```bash
+curl -fsSL https://github.com/Aosiee/hamr/releases/download/v0.1.0/hamr-v0.1.0-linux-x86_64.tar.gz | tar -xz
+./hamr-v0.1.0-linux-x86_64/hamr --version
+```
+
+Or build it from source (below). How branches, streams and releases work is
+in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Building
 
