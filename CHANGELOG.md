@@ -32,3 +32,5 @@ The first release.
 - `hamr run --dry-run`; `--changed` asks the repository nearest the suite.
 - A step with sub-steps reports the time they spent queued apart
   (`queuedSeconds`); its budget is held to its active time.
+- A Linux x86-64 download for each release: the binary (its standard
+  library built in), the reference and the C++ test library's header.
