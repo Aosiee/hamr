@@ -123,7 +123,7 @@ export type JUnitCase = {
 	message: string?,
 }
 
-// The test cases of a JUnit XML file (ctest --output-junit, doctest's
+// The test cases of a JUnit XML file (ctest --output-junit, a test
 // junit reporter), with their times.
 function M.readJUnit(path: string): { JUnitCase }? {
 	const text = host.read(path)
@@ -159,7 +159,7 @@ function M.readJUnit(path: string): { JUnitCase }? {
 			message = string.match(body, "message=\"([^\"]*)\"")
 		}
 		table.insert(tests, {
-			// A classname that is a file path (doctest) adds nothing to the name.
+			// A classname that is a file path adds nothing to the name.
 			name = if (className != nil && className != "" && className != name && !string.find(className, "/", 1, true)) `{className}.{name}` else name,
 			seconds = tonumber(attribute(attrs, "time") || "0") || 0,
 			status = status,
