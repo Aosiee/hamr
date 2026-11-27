@@ -157,5 +157,10 @@ reports.
 
 ## License
 
-The hamr License (`LICENSE`): MIT-style, with an attribution line for products
-that include hamr.
+hamr is released under the Odd Fish Society License ([`LICENSE`](LICENSE)), which is MIT
+with one added condition. A product that includes hamr, or is built or tested with it,
+credits it in its credits, about box or documentation, as "Uses hamr - Copyright (c)
+2026 Odd Fish Society / Felipe Lara". A product that uses several Odd Fish Society
+libraries can credit them together, on one line or several, such as "Uses kiln, cluau
+and wisp - Copyright (c) 2026 Odd Fish Society / Felipe Lara". No logo or splash screen
+is required.
